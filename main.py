@@ -63,39 +63,20 @@ def home():
 async def recibir_webhook(request: Request):
     data = await request.json()
     
-    # Extraemos el ID del pago enviado por Mercado Pago
-    payment_id = str(data.get("data", {}).get("id"))
+    # FORZAMOS el guardado de cualquier cosa que llegue
+    # para ver si el problema es el filtro de 'status'
+    payment_id = str(data.get("data", {}).get("id", "sin_id"))
     
-    if payment_id and MP_ACCESS_TOKEN:
-        # Consultamos a la API oficial de Mercado Pago para obtener datos reales
-        async with httpx.AsyncClient() as client:
-            headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-            response = await client.get(
-                f"https://api.mercadopago.com/v1/payments/{payment_id}",
-                headers=headers,
-            )
-
-            if response.status_code == 200:
-                pago_info = response.json()
-                
-                # Solo procesamos si el pago está aprobado
-                if pago_info.get("status") == "approved":
-                    monto = float(pago_info.get("transaction_amount", 0.0))
-                    payer = pago_info.get("payer", {})
-                    nombre = payer.get("first_name", "Cliente")
-                    apellido = payer.get("last_name", "")
-                    remitente = f"{nombre} {apellido}".strip()
-
-                    # Evitamos duplicados
-                    if not any(t["id"] == payment_id for t in transacciones_memoria):
-                        transacciones_memoria.append({
-                            "id": payment_id,
-                            "monto": monto,
-                            "remitente": remitente,
-                            "entregado": False,
-                        })
+    # Lo agregamos a la lista sin consultar nada a la API por ahora
+    # para descartar problemas con el Access Token
+    transacciones_memoria.append({
+        "id": payment_id,
+        "monto": 999999, # Monto falso para identificar que entró
+        "remitente": f"DEBUG: {data.get('type')}",
+        "entregado": False,
+    })
     
-    return {"status": "ok"}
+    return {"status": "ok_debug"}
 
 @app.post("/simular-pago")
 def simular_pago(id: str, monto: float, remitente: str):
