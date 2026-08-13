@@ -1,21 +1,19 @@
 import os
-from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 import httpx
 
 app = FastAPI()
 
-# Leemos el Token de forma segura desde las variables de entorno de Vercel
+# Leemos el Access Token desde las variables de entorno de Vercel
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 
 # Lista temporal en memoria para demostración en Vercel
 transacciones_memoria = []
 
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-  html = """
+    html = """
     <html>
         <head>
             <title>Control de Efectivo - MP</title>
@@ -33,23 +31,14 @@ def home():
             <h1>Control de Transferencias (Vercel) 💸</h1>
             <p>Panel activo en la nube:</p>
     """
-
-  for t in transacciones_memoria:
-    estado = (
-        "<span class='badge-ok'>ENTREGADO</span>"
-        if t["entregado"]
-        else "<span class='badge-no'>DISPONIBLE PARA RETIRAR</span>"
-    )
-    boton = (
-        f'<button class="btn btn-disabled" disabled>Ya entregado</button>'
-        if t["entregado"]
-        else (
-            f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar'
-            " como Entregado</button>"
-        )
-    )
-
-    html += f"""
+    if not transacciones_memoria:
+        html += "<p>No hay transacciones registradas todavía.</p>"
+    
+    for t in transacciones_memoria:
+        estado = "<span class='badge-ok'>ENTREGADO</span>" if t["entregado"] else "<span class='badge-no'>DISPONIBLE PARA RETIRAR</span>"
+        boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
+        
+        html += f"""
         <div class="card">
             <h3>Remitente: {t["remitente"]}</h3>
             <p>Monto: <b>${t["monto"]}</b></p>
@@ -58,103 +47,69 @@ def home():
         </div>
         """
 
-  html += """
+    html += """
             <script>
                 async function entregar(id) {
                     let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
-                    let data = await res.json();
-                    if(res.ok) {
-                        location.reload();
-                    } else {
-                        alert(data.detail);
-                    }
+                    if(res.ok) { location.reload(); } else { alert('Error al marcar'); }
                 }
             </script>
         </body>
     </html>
     """
-  return html
-
+    return html
 
 @app.post("/webhook")
 async def recibir_webhook(request: Request):
-  data = await request.json()
-
-  tipo_evento = data.get("type")
-  payment_id = None
-  monto = 0.0
-  remitente = "Cliente de Transferencia"
-
-  # Identificamos si es un pago directo o una orden comercial
-  if tipo_evento == "payment":
+    data = await request.json()
+    
+    # Extraemos el ID del pago enviado por Mercado Pago
     payment_id = str(data.get("data", {}).get("id"))
-  elif tipo_evento == "order":
-    payment_id = str(data.get("data", {}).get("id"))
-    monto = float(data.get("data", {}).get("total_paid_amount", 0.0))
+    
+    if payment_id and MP_ACCESS_TOKEN:
+        # Consultamos a la API oficial de Mercado Pago para obtener datos reales
+        async with httpx.AsyncClient() as client:
+            headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+            response = await client.get(
+                f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                headers=headers,
+            )
 
-  # Si tenemos un ID válido, procedemos
-  if payment_id:
-    # Si es un evento de pago tradicional, consultamos los detalles reales a la API
-    if tipo_evento == "payment" and MP_ACCESS_TOKEN:
-      async with httpx.AsyncClient() as client:
-        headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-        response = await client.get(
-            f"https://api.mercadopago.com/v1/payments/{payment_id}",
-            headers=headers,
-        )
+            if response.status_code == 200:
+                pago_info = response.json()
+                
+                # Solo procesamos si el pago está aprobado
+                if pago_info.get("status") == "approved":
+                    monto = float(pago_info.get("transaction_amount", 0.0))
+                    payer = pago_info.get("payer", {})
+                    nombre = payer.get("first_name", "Cliente")
+                    apellido = payer.get("last_name", "")
+                    remitente = f"{nombre} {apellido}".strip()
 
-        if response.status_code == 200:
-          pago_info = response.json()
-          monto = pago_info.get("transaction_amount", 0.0)
-
-          payer = pago_info.get("payer", {})
-          nombre = payer.get("first_name", "")
-          apellido = payer.get("last_name", "")
-          if nombre or apellido:
-            remitente = f"{nombre} {apellido}".strip()
-
-    # Evitamos duplicados si el webhook se dispara dos veces
-    for t in transacciones_memoria:
-      if t["id"] == payment_id:
-        return {"status": "already_exists"}
-
-    # Insertamos en la lista de memoria
-    transacciones_memoria.append({
-        "id": payment_id,
-        "monto": monto,
-        "remitente": remitente,
-        "entregado": False,
-    })
-
-  return {"status": "ok"}
-
+                    # Evitamos duplicados
+                    if not any(t["id"] == payment_id for t in transacciones_memoria):
+                        transacciones_memoria.append({
+                            "id": payment_id,
+                            "monto": monto,
+                            "remitente": remitente,
+                            "entregado": False,
+                        })
+    
+    return {"status": "ok"}
 
 @app.post("/simular-pago")
 def simular_pago(id: str, monto: float, remitente: str):
-  for t in transacciones_memoria:
-    if t["id"] == id:
-      raise HTTPException(status_code=400, detail="Ese ID de pago ya fue simulado")
-
-  transacciones_memoria.append({
-      "id": id,
-      "monto": monto,
-      "remitente": remitente,
-      "entregado": False,
-  })
-  return {"message": "Pago simulado con éxito en Vercel"}
-
+    if any(t["id"] == id for t in transacciones_memoria):
+        raise HTTPException(status_code=400, detail="Ese ID de pago ya existe")
+    transacciones_memoria.append({"id": id, "monto": monto, "remitente": remitente, "entregado": False})
+    return {"message": "Pago simulado con éxito"}
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
-  for t in transacciones_memoria:
-    if t["id"] == payment_id:
-      if t["entregado"]:
-        raise HTTPException(
-            status_code=400,
-            detail="¡CUIDADO! Esta transferencia ya fue entregada anteriormente.",
-        )
-      t["entregado"] = True
-      return {"message": "Marcado como entregado"}
-
-  raise HTTPException(status_code=404, detail="Transferencia no encontrada")
-  
+    for t in transacciones_memoria:
+        if t["id"] == payment_id:
+            if t["entregado"]:
+                raise HTTPException(status_code=400, detail="Ya entregado.")
+            t["entregado"] = True
+            return {"message": "Marcado como entregado"}
+    raise HTTPException(status_code=404, detail="No encontrado")
