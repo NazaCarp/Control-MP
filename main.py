@@ -1,20 +1,16 @@
+import os
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+import httpx
 
 app = FastAPI()
 
+# Leemos el Token de forma segura desde las variables de entorno de Vercel
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+
 # Lista temporal en memoria para demostración en Vercel
-# (Nota: En un entorno serverless se reinicia, ideal para pruebas rápidas)
 transacciones_memoria = []
-
-
-class Transaccion(BaseModel):
-  id: str
-  monto: float
-  remitente: str
-  entregado: bool = False
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -83,21 +79,46 @@ def home():
 @app.post("/webhook")
 async def recibir_webhook(request: Request):
   data = await request.json()
-  # Aquí procesarías el pago real de Mercado Pago
-  payment_id = str(data.get("data", {}).get("id", "test_id"))
 
-  # Evitamos duplicados si el webhook se dispara dos veces
-  for t in transacciones_memoria:
-    if t["id"] == payment_id:
-      return {"status": "already_exists"}
+  # Verificamos si la notificación corresponde a un pago
+  if data.get("type") == "payment":
+    payment_id = str(data.get("data", {}).get("id"))
 
-  # Insertamos automáticamente el ingreso real
-  transacciones_memoria.append({
-      "id": payment_id,
-      "monto": 5000.0,
-      "remitente": "Cliente Webhook MP",
-      "entregado": False,
-  })
+    monto = 0.0
+    remitente = "Cliente de Transferencia"
+
+    # Consultamos los datos reales a la API de Mercado Pago si tenemos el token configurado
+    if MP_ACCESS_TOKEN and payment_id:
+      async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+        response = await client.get(
+            f"https://api.mercadopago.com/v1/payments/{payment_id}",
+            headers=headers,
+        )
+
+        if response.status_code == 200:
+          pago_info = response.json()
+          monto = pago_info.get("transaction_amount", 0.0)
+
+          payer = pago_info.get("payer", {})
+          nombre = payer.get("first_name", "")
+          apellido = payer.get("last_name", "")
+          if nombre or apellido:
+            remitente = f"{nombre} {apellido}".strip()
+
+    # Evitamos duplicados si el webhook se dispara dos veces
+    for t in transacciones_memoria:
+      if t["id"] == payment_id:
+        return {"status": "already_exists"}
+
+    # Insertamos automáticamente el ingreso real con sus datos verdaderos
+    transacciones_memoria.append({
+        "id": payment_id,
+        "monto": monto,
+        "remitente": remitente,
+        "entregado": False,
+    })
+
   return {"status": "ok"}
 
 
