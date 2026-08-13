@@ -157,4 +157,3 @@ def marcar_entregado(payment_id: str):
       return {"message": "Marcado como entregado"}
 
   raise HTTPException(status_code=404, detail="Transferencia no encontrada")
-  
