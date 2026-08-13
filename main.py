@@ -5,10 +5,8 @@ import httpx
 
 app = FastAPI()
 
-# Leemos el Access Token desde las variables de entorno de Vercel
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 
-# Lista temporal en memoria para demostración en Vercel
 transacciones_memoria = []
 
 @app.get("/", response_class=HTMLResponse)
@@ -63,20 +61,49 @@ def home():
 async def recibir_webhook(request: Request):
     data = await request.json()
     
-    # FORZAMOS el guardado de cualquier cosa que llegue
-    # para ver si el problema es el filtro de 'status'
-    payment_id = str(data.get("data", {}).get("id", "sin_id"))
+    payment_id = str(data.get("data", {}).get("id"))
+    tipo_evento = data.get("type")
     
-    # Lo agregamos a la lista sin consultar nada a la API por ahora
-    # para descartar problemas con el Access Token
-    transacciones_memoria.append({
-        "id": payment_id,
-        "monto": 999999, # Monto falso para identificar que entró
-        "remitente": f"DEBUG: {data.get('type')}",
-        "entregado": False,
-    })
-    
-    return {"status": "ok_debug"}
+    if payment_id:
+        monto = 0.0
+        remitente = "Transferencia Mercado Pago"
+
+        # Intentamos consultar la API oficial si tenemos el token para traer el monto real
+        if MP_ACCESS_TOKEN and tipo_evento == "payment":
+            try:
+                async with httpx.AsyncClient() as client:
+                    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+                    response = await client.get(
+                        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                        headers=headers,
+                    )
+                    if response.status_code == 200:
+                        pago_info = response.json()
+                        monto = float(pago_info.get("transaction_amount", 0.0))
+                        payer = pago_info.get("payer", {})
+                        nombre = payer.get("first_name", "")
+                        apellido = payer.get("last_name", "")
+                        if nombre or apellido:
+                            remitente = f"{nombre} {apellido}".strip()
+            except Exception:
+                pass # Si falla la consulta externa, evitamos que rompa el webhook
+
+        # Evitamos duplicados
+        existe = False
+        for t in transacciones_memoria:
+            if t["id"] == payment_id:
+                existe = True
+                break
+
+        if not existe:
+            transacciones_memoria.append({
+                "id": payment_id,
+                "monto": monto,
+                "remitente": remitente,
+                "entregado": False,
+            })
+            
+    return {"status": "ok"}
 
 @app.post("/simular-pago")
 def simular_pago(id: str, monto: float, remitente: str):
