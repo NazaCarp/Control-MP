@@ -80,15 +80,22 @@ def home():
 async def recibir_webhook(request: Request):
   data = await request.json()
 
-  # Verificamos si la notificación corresponde a un pago
-  if data.get("type") == "payment":
+  tipo_evento = data.get("type")
+  payment_id = None
+  monto = 0.0
+  remitente = "Cliente de Transferencia"
+
+  # Identificamos si es un pago directo o una orden comercial
+  if tipo_evento == "payment":
     payment_id = str(data.get("data", {}).get("id"))
+  elif tipo_evento == "order":
+    payment_id = str(data.get("data", {}).get("id"))
+    monto = float(data.get("data", {}).get("total_paid_amount", 0.0))
 
-    monto = 0.0
-    remitente = "Cliente de Transferencia"
-
-    # Consultamos los datos reales a la API de Mercado Pago si tenemos el token configurado
-    if MP_ACCESS_TOKEN and payment_id:
+  # Si tenemos un ID válido, procedemos
+  if payment_id:
+    # Si es un evento de pago tradicional, consultamos los detalles reales a la API
+    if tipo_evento == "payment" and MP_ACCESS_TOKEN:
       async with httpx.AsyncClient() as client:
         headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
         response = await client.get(
@@ -111,7 +118,7 @@ async def recibir_webhook(request: Request):
       if t["id"] == payment_id:
         return {"status": "already_exists"}
 
-    # Insertamos automáticamente el ingreso real con sus datos verdaderos
+    # Insertamos en la lista de memoria
     transacciones_memoria.append({
         "id": payment_id,
         "monto": monto,
