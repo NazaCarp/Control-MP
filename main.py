@@ -26,29 +26,33 @@ def home():
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
                 body { font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }
-                .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); word-break: break-all; }
+                .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
                 .btn { background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }
                 .btn-success { background: #28a745; margin-bottom: 20px; }
+                .btn-disabled { background: #ccc; cursor: not-allowed; }
             </style>
         </head>
         <body>
-            <h1>Control de Transferencias (Inspección de Claves) 💸</h1>
-            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Sincronizar y Ver Datos</button>
+            <h1>Control de Transferencias (CVU/Alias) 💸</h1>
+            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay registros cargados.</p>"
+        html += "<p>No hay transferencias cargadas. Hacé clic en 'Buscar Nuevas Transferencias'.</p>"
     
     for t in transacciones_memoria:
+        estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
+        boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
+        
         html += f"""
         <div class="card">
-            <h3>Remitente: {t["remitente"]}</h3>
+            <h3>Tipo: {t["remitente"]}</h3>
             <p>ID: {t["id"]}</p>
             <p>Monto: <b>${t["monto"]}</b></p>
-            <hr>
-            <small style="color: #666;"><b>Debug Row Keys:</b> {t["keys_raw"]}</small>
+            <p>Estado: {estado}</p>
+            {boton}
         </div>
         """
 
@@ -61,7 +65,7 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Analizando estructura del CSV...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago... Por favor esperá unos segundos...</b></p>';
 
                     try {
                         let res = await fetch('/sincronizar-reportes', { method: 'POST' });
@@ -70,17 +74,22 @@ def home():
                             alert(data.message);
                             location.reload();
                         } else {
-                            alert('Aviso: ' + (data.detail || 'Error'));
+                            alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
                             statusDiv.innerHTML = '';
                             btn.disabled = false;
                             btn.style.background = '#28a745';
                         }
                     } catch (e) {
-                        alert('Error de red.');
+                        alert('Error de red o timeout. Intentá de nuevo.');
                         statusDiv.innerHTML = '';
                         btn.disabled = false;
                         btn.style.background = '#28a745';
                     }
+                }
+
+                async function entregar(id) {
+                    let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
+                    if(res.ok) { location.reload(); } else { alert('Error al marcar'); }
                 }
             </script>
         </body>
@@ -91,7 +100,7 @@ def home():
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
     if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Falta el token")
+        raise HTTPException(status_code=500, detail="Falta configurar el MP_ACCESS_TOKEN en Vercel")
 
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
@@ -133,33 +142,46 @@ async def sincronizar_reportes():
             await asyncio.sleep(4)
 
         if not file_name:
-            raise HTTPException(status_code=400, detail="El reporte se está procesando.")
+            raise HTTPException(status_code=400, detail="El reporte se está generando en Mercado Pago. Volvé a hacer clic en unos segundos.")
 
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="No se pudo descargar.")
+            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
 
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         
-        transacciones_memoria.clear()
-        registros_agregados = 0
-
-        # Tomamos solo los primeros 5 para inspeccionar en pantalla las columnas exactas que trae el CSV
+        nuevas_cantidades = 0
         for row in reader:
-            if registros_agregados >= 5:
-                break
-                
-            # Extraemos las llaves reales del diccionario para mostrarlas en la tarjeta
-            keys_str = ", ".join(list(row.keys())[:10]) # Muestra las primeras 10 columnas del CSV
+            p_id = str(row.get("SOURCE_ID") or "unknown_id")
+            monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or "0"
+            
+            try:
+                monto = float(monto_str)
+            except ValueError:
+                monto = 0.0
 
-            transacciones_memoria.append({
-                "id": "Inspeccionando",
-                "monto": 0.0,
-                "remitente": "Fila de prueba CSV",
-                "keys_raw": keys_str,
-                "entregado": False
-            })
-            registros_agregados += 1
+            tx_type = row.get("TRANSACTION_TYPE") or "transferencia"
+            pm_type = row.get("PAYMENT_METHOD_TYPE") or ""
+            remitente = f"{tx_type} ({pm_type})"
 
-    return {"message": "Inspección completada. Mirá las columnas en pantalla."}
+            if not any(t["id"] == p_id for t in transacciones_memoria):
+                transacciones_memoria.append({
+                    "id": p_id,
+                    "monto": abs(monto),
+                    "remitente": remitente,
+                    "entregado": False
+                })
+                nuevas_cantidades += 1
+
+    return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
+
+@app.post("/marcar-entregado/{payment_id}")
+def marcar_entregado(payment_id: str):
+    for t in transacciones_memoria:
+        if t["id"] == payment_id:
+            if t["entregado"]:
+                raise HTTPException(status_code=400, detail="Ya entregado.")
+            t["entregado"] = True
+            return {"message": "Marcado como entregado"}
+    raise HTTPException(status_code=404, detail="No encontrado")
