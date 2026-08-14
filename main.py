@@ -1,6 +1,7 @@
 import os
 import csv
 import io
+import asyncio
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -11,7 +12,6 @@ app = FastAPI()
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 API_BASE = "https://api.mercadopago.com"
 
-# Lista temporal en memoria
 transacciones_memoria = []
 
 def iso_z(dt: datetime) -> str:
@@ -59,14 +59,14 @@ def home():
             </div>
             <script>
                 async function sincronizar() {
-                    document.getElementById('status-sync').innerHTML = '<p><i>Buscando en Mercado Pago... (esto puede tardar unos segundos)</i></p>';
+                    document.getElementById('status-sync').innerHTML = '<p><i>Procesando reporte en Mercado Pago... Esto puede demorar unos segundos.</i></p>';
                     let res = await fetch('/sincronizar-reportes', { method: 'POST' });
                     let data = await res.json();
                     if(res.ok) {
                         alert(data.message);
                         location.reload();
                     } else {
-                        alert('Error: ' + (data.detail || 'No se pudo sincronizar'));
+                        alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
                         document.getElementById('status-sync').innerHTML = '';
                     }
                 }
@@ -92,21 +92,30 @@ async def sincronizar_reportes():
     }
 
     now = datetime.now(timezone.utc)
-    begin = now - timedelta(hours=24) # Buscamos las últimas 24 horas
+    begin = now - timedelta(hours=24)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Crear el reporte
-        payload = {"begin_date": iso_z(begin), "end_date": iso_z(now)}
-        create_resp = await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
-        
-        if create_resp.status_code not in [200, 201]:
-            raise HTTPException(status_code=400, detail=f"Error al solicitar reporte a MP: {create_resp.text}")
-
-        # 2. Buscar el archivo listo (Hacemos un par de intentos asíncronos cortos para no bloquear Vercel)
-        file_name = None
         params = {"begin_date": iso_z(begin), "end_date": iso_z(now), "created_from": "manual", "limit": 10}
         
-        for _ in range(3): # Intentamos 3 veces con pausa corta
+        # 1. Buscamos si ya hay un reporte creado previamente para evitar duplicarlo
+        file_name = None
+        search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
+        
+        if search_resp.status_code == 200:
+            data = search_resp.json()
+            reports = data.get("results") or data.get("data") or []
+            for r in reports:
+                if r.get("status") == "processed" and r.get("file_name"):
+                    file_name = r["file_name"]
+                    break
+
+        # 2. Si no hay uno procesado, intentamos crearlo (si tira error porque ya existe uno pendiente, lo ignoramos y pasamos a buscarlo)
+        if not file_name:
+            payload = {"begin_date": iso_z(begin), "end_date": iso_z(now)}
+            await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
+
+        # 3. Esperamos y reintentamos hasta 4 veces a que el reporte pase a estado 'processed'
+        for _ in range(4):
             search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
             if search_resp.status_code == 200:
                 data = search_resp.json()
@@ -117,35 +126,29 @@ async def sincronizar_reportes():
                         break
             if file_name:
                 break
-            # Espera asíncrona de 2 segundos sin congelar el servidor
-            await httpx.AsyncClient().get("https://httpbin.org/delay/2") # o usar asyncio.sleep(2)
-            import asyncio
-            await asyncio.sleep(2)
+            await asyncio.sleep(3) # Espera 3 segundos ordenadamente
 
         if not file_name:
-            raise HTTPException(status_code=404, detail="El reporte aún se está procesando en Mercado Pago. Intentá de nuevo en un minuto.")
+            raise HTTPException(status_code=400, detail="El reporte sigue procesándose en los servidores de Mercado Pago[cite: 1]. Volvé a hacer clic en 'Buscar Nuevas Transferencias' en 30 segundos.")
 
-        # 3. Descargar el CSV del reporte
+        # 4. Descargamos el reporte CSV[cite: 1]
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
             raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
 
-        # 4. Procesar el CSV
+        # 5. Procesamos la información
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         
         nuevas_cantidades = 0
         for row in reader:
-            # Acá adaptás según los nombres de columnas exactos de tu reporte de MP
             movement_type = (row.get("MOVEMENT_TYPE") or row.get("tipo_movimiento") or "").lower()
             
-            # Filtramos ingresos de dinero / transferencias
             if "transfer" in movement_type or "ingress" in movement_type or "money_transfer" in movement_type:
                 p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("reference_id") or row.get("EXTERNAL_REFERENCE") or "unknown_id")
                 monto = float(row.get("AMOUNT") or row.get("transaction_amount") or row.get("monto") or 0.0)
                 remitente = row.get("COUNTERPART_NAME") or row.get("payer_name") or "Transferencia CVU"
 
-                # Evitar duplicados en memoria
                 if not any(t["id"] == p_id for t in transacciones_memoria):
                     transacciones_memoria.append({
                         "id": p_id,
