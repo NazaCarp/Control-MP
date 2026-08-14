@@ -32,20 +32,20 @@ def home():
             </style>
         </head>
         <body>
-            <h1>Control de Transferencias (Modo Debug Total) 💸</h1>
-            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Descargar TODO el reporte (10hs)</button>
+            <h1>Control de Transferencias (Mapeo de Columnas) 💸</h1>
+            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Sincronizar Reporte (10hs)</button>
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay registros cargados. Hacé clic en el botón para inspeccionar el reporte.</p>"
+        html += "<p>No hay registros cargados. Hacé clic en el botón.</p>"
     
     for t in transacciones_memoria:
         html += f"""
         <div class="card">
-            <h3>Remitente / Tipo: {t["remitente"]}</h3>
-            <p>ID: {t["id"]}</p>
+            <h3>Remitente: {t["remitente"]}</h3>
+            <p>ID / Referencia: {t["id"]}</p>
             <p>Monto: <b>${t["monto"]}</b></p>
         </div>
         """
@@ -59,7 +59,7 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Descargando y leyendo reporte de Mercado Pago...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Analizando columnas del reporte...</b></p>';
 
                     try {
                         let res = await fetch('/sincronizar-reportes', { method: 'POST' });
@@ -74,7 +74,7 @@ def home():
                             btn.style.background = '#28a745';
                         }
                     } catch (e) {
-                        alert('Error de red o timeout. Intentá de nuevo.');
+                        alert('Error de red o timeout.');
                         statusDiv.innerHTML = '';
                         btn.disabled = false;
                         btn.style.background = '#28a745';
@@ -89,7 +89,7 @@ def home():
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
     if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Falta configurar el MP_ACCESS_TOKEN en Vercel")
+        raise HTTPException(status_code=500, detail="Falta configurar el MP_ACCESS_TOKEN")
 
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
@@ -131,34 +131,40 @@ async def sincronizar_reportes():
             await asyncio.sleep(4)
 
         if not file_name:
-            raise HTTPException(status_code=400, detail="El reporte se está generando. Volvé a intentarlo en unos segundos.")
+            raise HTTPException(status_code=400, detail="El reporte se está procesando. Intentá de nuevo en unos segundos.")
 
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
+            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo.")
 
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         
+        transacciones_memoria.clear() # Limpiamos para actualizar con los datos limpios
         registros_agregados = 0
+
         for row in reader:
-            # SIN FILTROS: Capturamos cualquier columna disponible para ver qué trae el CSV
-            p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("reference_id") or row.get("EXTERNAL_REFERENCE") or "id_desconocido")
-            monto = float(row.get("AMOUNT") or row.get("transaction_amount") or row.get("monto") or 0.0)
+            # Buscamos en todas las variantes posibles de nombres de columnas de Mercado Pago
+            p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("REFERENCE_ID") or row.get("EXTERNAL_REFERENCE") or row.get("TRANSACTION_ID") or "Sin ID")
             
-            # Intentamos leer el tipo de movimiento y contraparte de cualquier columna posible
-            tipo = row.get("MOVEMENT_TYPE") or row.get("tipo_movimiento") or row.get("OPERATION_TYPE") or "Tipo genérico"
-            contraparte = row.get("COUNTERPART_NAME") or row.get("payer_name") or row.get("DESCRIPTION") or "Sin detalle"
-            
-            remitente_texto = f"[{tipo}] - {contraparte}"
+            # Buscamos montos (puede venir como AMOUNT, TRANSACTION_AMOUNT, GROSS_AMOUNT, etc.)
+            monto_str = row.get("AMOUNT") or row.get("TRANSACTION_AMOUNT") or row.get("GROSS_AMOUNT") or row.get("NET_AMOUNT") or "0.0"
+            try:
+                monto = float(monto_str)
+            except ValueError:
+                monto = 0.0
 
-            if not any(t["id"] == p_id for t in transacciones_memoria):
-                transacciones_memoria.append({
-                    "id": p_id,
-                    "monto": monto,
-                    "remitente": remitente_texto,
-                    "entregado": False
-                })
-                registros_agregados += 1
+            # Buscamos descripciones o nombres de contraparte
+            remitente = row.get("COUNTERPART_NAME") or row.get("PAYER_NAME") or row.get("DESCRIPTION") or row.get("TITLE") or row.get("REASON") or "Transferencia / Movimiento"
+            tipo_mov = row.get("MOVEMENT_TYPE") or row.get("OPERATION_TYPE") or "Movimiento"
 
-    return {"message": f"Lectura completa. Se cargaron {registros_agregados} registros encontrados en el reporte."}
+            # Guardamos el registro formateado limpio
+            transacciones_memoria.append({
+                "id": p_id,
+                "monto": abs(monto),
+                "remitente": f"{remitente} ({tipo_mov})",
+                "entregado": False
+            })
+            registros_agregados += 1
+
+    return {"message": f"Lectura exitosa. Se procesaron {registros_agregados} registros."}
