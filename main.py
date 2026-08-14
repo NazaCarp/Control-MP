@@ -46,9 +46,9 @@ def home():
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
         boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
         
+        # Eliminada la línea de Tipo / Remitente
         html += f"""
         <div class="card">
-            <h3>Tipo: {t["remitente"]}</h3>
             <p>ID: {t["id"]}</p>
             <p>Fecha: <b>{t["fecha"]}</b></p>
             <p>Monto: <b>${t["monto"]}</b></p>
@@ -162,20 +162,13 @@ async def sincronizar_reportes():
             except ValueError:
                 monto = 0.0
 
-            tx_type = row.get("TRANSACTION_TYPE") or "movimiento"
-            pm_type = row.get("PAYMENT_METHOD_TYPE") or ""
-            remitente = f"{tx_type} ({pm_type})"
-            
-            # Capturamos la fecha de la transacción (o ponemos una por defecto si falta)
             fecha_bruta = row.get("TRANSACTION_DATE") or "Sin fecha"
-            # Limpiamos un poco el formato de fecha para que sea más legible (opcionalmente cortamos los milisegundos y zona horaria)
             fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ") if "T" in fecha_bruta else fecha_bruta
 
             if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                 transacciones_memoria.append({
                     "id": p_id,
                     "monto": abs(monto),
-                    "remitente": remitente,
                     "fecha": fecha_limpia,
                     "entregado": False
                 })
