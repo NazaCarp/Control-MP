@@ -48,7 +48,7 @@ def home():
         
         html += f"""
         <div class="card">
-            <h3>Tipo: {t["remitente"]}</h3>
+            <h3>Detalle: {t["remitente"]}</h3>
             <p>ID: {t["id"]}</p>
             <p>Monto: <b>${t["monto"]}</b></p>
             <p>Estado: {estado}</p>
@@ -152,20 +152,23 @@ async def sincronizar_reportes():
         reader = csv.DictReader(io.StringIO(text))
         
         nuevas_cantidades = 0
-        for row in reader:
-            p_id = str(row.get("SOURCE_ID") or "unknown_id")
-            monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or "0"
+        for i, row in enumerate(reader):
+            # Buscamos ID en varias columnas posibles, si no hay ninguna usamos una combinada con el índice
+            p_id = str(row.get("SOURCE_ID") or row.get("PAYMENT_ID") or row.get("ID") or f"row_{i}")
             
+            # Buscamos el monto en las columnas financieras principales
+            monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or row.get("AMOUNT") or "0"
             try:
                 monto = float(monto_str)
             except ValueError:
                 monto = 0.0
 
-            tx_type = row.get("TRANSACTION_TYPE") or "transferencia"
+            tx_type = row.get("TRANSACTION_TYPE") or "movimiento"
             pm_type = row.get("PAYMENT_METHOD_TYPE") or ""
             remitente = f"{tx_type} ({pm_type})"
 
-            if not any(t["id"] == p_id for t in transacciones_memoria):
+            # Solo agregamos si el monto es mayor a 0 para descartar registros vacíos
+            if monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                 transacciones_memoria.append({
                     "id": p_id,
                     "monto": abs(monto),
