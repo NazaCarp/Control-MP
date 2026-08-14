@@ -1,0 +1,109 @@
+import csv
+import io
+import time
+from datetime import datetime, timezone, timedelta
+
+import requests
+
+
+SETTLEMENT_REPORT_PATH = "/v1/account/settlement_report"
+SETTLEMENT_REPORT_SEARCH_PATH = "/v1/account/settlement_report/search"
+SETTLEMENT_REPORT_DOWNLOAD_PATH = "/v1/account/settlement_report/{file_name}"
+
+
+def iso_z(dt: datetime) -> str:
+    # API espera UTC con 'Z'
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def mp_request(session: requests.Session, method: str, api_base: str, path: str, **kwargs) -> requests.Response:
+    url = f"{api_base}{path}"
+    resp = session.request(method, url, timeout=30, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
+def create_report(session: requests.Session, api_base: str, begin_dt: datetime, end_dt: datetime) -> dict:
+    payload = {"begin_date": iso_z(begin_dt), "end_date": iso_z(end_dt)}
+    resp = mp_request(session, "POST", api_base, SETTLEMENT_REPORT_PATH, json=payload)
+    return resp.json()
+
+
+def find_ready_report_file_name(session: requests.Session, api_base: str, begin_dt: datetime, end_dt: datetime,
+                               max_wait_seconds: int = 60) -> str:
+    """
+    Busca un reporte para ese mismo intervalo y espera hasta que exista un registro con status 'processed'
+    y un file_name disponible.
+    """
+    deadline = time.time() + max_wait_seconds
+
+    while time.time() < deadline:
+        params = {
+            "begin_date": iso_z(begin_dt),
+            "end_date": iso_z(end_dt),
+            "created_from": "manual",
+            "limit": 30,
+            "offset": 0,
+        }
+        data = mp_request(session, "GET", api_base, SETTLEMENT_REPORT_SEARCH_PATH, params=params).json()
+
+        # TODO: ajustá esta extracción a la forma exacta del JSON de respuesta.
+        reports = data.get("results") or data.get("data") or []
+        for r in reports:
+            if r.get("status") == "processed" and r.get("file_name"):
+                return r["file_name"]
+
+        time.sleep(2)
+
+    raise TimeoutError("El reporte todavía no está listo para descargar.")
+
+
+def download_report_csv(session: requests.Session, api_base: str, file_name: str) -> list[dict]:
+    path = SETTLEMENT_REPORT_DOWNLOAD_PATH.format(file_name=file_name)
+    resp = mp_request(session, "GET", api_base, path)
+
+    # El endpoint devuelve el archivo (CSV o XLSX). Acá asumimos CSV.
+    text = resp.content.decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    return list(reader)
+
+
+def is_incoming_transfer(row: dict) -> bool:
+    """
+    Definí acá la condición exacta según las columnas/valores de TU reporte.
+    Para eso, identificá una fila real de transferencia entrante por CVU/alias
+    y usá el glosario/campos para mapear.
+    """
+    # Ejemplo: reemplazá estos checks por los que correspondan a tus columnas.
+    movement_type = (row.get("MOVEMENT_TYPE") or "").lower()
+    direction = (row.get("DIRECTION") or "").lower()
+
+    return ("transfer" in movement_type) and (direction in {"in", "income", "credit", "entrada"})
+
+
+def refresh_incoming_transfers(api_base: str, access_token: str, last_sync_at_utc: datetime | None) -> tuple[list[dict], datetime]:
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    })
+
+    now = datetime.now(timezone.utc)
+
+    # Si es la primera vez: traé una ventana inicial (ej. 24h).
+    if last_sync_at_utc is None:
+        begin = now - timedelta(hours=24)
+    else:
+        # Solape chico para no perder movimientos por demoras de consolidación.
+        begin = last_sync_at_utc - timedelta(minutes=5)
+
+    end = now
+
+    create_report(session, api_base, begin, end)
+    file_name = find_ready_report_file_name(session, api_base, begin, end, max_wait_seconds=90)
+    rows = download_report_csv(session, api_base, file_name)
+
+    incoming_transfers = [r for r in rows if is_incoming_transfer(r)]
+
+    # Acá devolvés la data a la app y guardás now como last_sync_at_utc.
+    return incoming_transfers, now

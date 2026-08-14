@@ -1,219 +1,168 @@
 import os
-from datetime import datetime, timedelta, timezone
-
-import httpx
+import csv
+import io
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
+import httpx
 
-app = FastAPI(title="Control de transferencias MP")
+app = FastAPI()
 
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-MP_API_URL = "https://api.mercadopago.com"
+API_BASE = "https://api.mercadopago.com"
 
-# Se usa como almacenamiento temporal mientras la app está corriendo
+# Lista temporal en memoria
 transacciones_memoria = []
 
-
-def get_incoming_transfers(payload):
-    if not isinstance(payload, dict):
-        return []
-
-    results = payload.get("results") or []
-    transfers = []
-
-    for item in results:
-        payment_id = str(item.get("id") or "sin_id")
-        amount = item.get("transaction_amount") or item.get("amount") or 0
-        payer = item.get("payer") or {}
-        remitente = payer.get("email") or payer.get("first_name") or "Mercado Pago"
-        status = item.get("status") or "unknown"
-
-        transfer = {
-            "id": payment_id,
-            "monto": float(amount),
-            "remitente": remitente,
-            "estado": status,
-            "fecha": item.get("date_created") or datetime.now(timezone.utc).isoformat(),
-            "metodo": item.get("payment_method_id") or "unknown",
-            "entregado": False,
-        }
-
-        existing = next((t for t in transacciones_memoria if t["id"] == transfer["id"]), None)
-        if existing is not None:
-            transfer["entregado"] = existing.get("entregado", False)
-
-        transfers.append(transfer)
-
-    return transfers
-
-
-async def fetch_mp_incoming_transfers():
-    if not MP_ACCESS_TOKEN:
-        return []
-
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    params = {
-        "sort": "date_desc",
-        "criteria": "desc",
-        "limit": 10,
-    }
-
-    try:
-        response = await httpx.get(
-            f"{MP_API_URL}/v1/payments/search",
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Error consultando Mercado Pago: {exc}") from exc
-
-    payload = response.json()
-    return get_incoming_transfers(payload)
-
-
-async def sync_mp_transfers():
-    remote = await fetch_mp_incoming_transfers() if MP_ACCESS_TOKEN else []
-    if not remote:
-        return list(transacciones_memoria)
-
-    merged = []
-    seen = set()
-
-    for item in remote:
-        merged.append(item)
-        seen.add(item["id"])
-
-    for item in transacciones_memoria:
-        if item["id"] not in seen:
-            merged.append(item)
-
-    transacciones_memoria.clear()
-    transacciones_memoria.extend(merged)
-    return merged
-
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    try:
-        transfers = await sync_mp_transfers()
-    except HTTPException:
-        transfers = list(transacciones_memoria)
-
-    if not transfers:
-        transfers = [
-            {
-                "id": "demo-001",
-                "monto": 1500.0,
-                "remitente": "Demo - Juan Pérez",
-                "estado": "approved",
-                "fecha": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(),
-                "metodo": "account_money",
-                "entregado": False,
-            }
-        ]
-
+def home():
     html = """
     <html>
         <head>
-            <title>Control de Transferencias - Mercado Pago</title>
+            <title>Control de Transferencias - MP</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
-                body { font-family: Arial; margin: 24px; background: #f4f4f9; color: #222; }
-                .card { background: white; padding: 18px; margin-bottom: 12px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-                .btn { background: #009ee3; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-size: 15px; }
-                .btn-done { background: #2d9a4b; }
-                .muted { color: #666; }
+                body { font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }
+                .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .btn { background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }
+                .btn-success { background: #28a745; margin-bottom: 20px; }
+                .btn-disabled { background: #ccc; cursor: not-allowed; }
             </style>
         </head>
         <body>
-            <h1>Transferencias entrantes</h1>
-            <p class="muted">Mercado Pago · listado para marcar como entregadas</p>
-            <button class="btn" onclick="location.reload()">Actualizar</button>
+            <h1>Control de Transferencias (CVU/Alias) 💸</h1>
+            <button class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
+            <div id="status-sync"></div>
+            <div id="panel">
     """
-
-    for t in transfers:
-        estado = "Entregada" if t.get("entregado") else "Pendiente"
-        boton = "Entregada" if t.get("entregado") else "Marcar como entregada"
-        boton_class = "btn btn-done" if t.get("entregado") else "btn"
+    
+    if not transacciones_memoria:
+        html += "<p>No hay transferencias cargadas. Hacé clic en 'Buscar Nuevas Transferencias'.</p>"
+    
+    for t in transacciones_memoria:
+        estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
+        boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
+        
         html += f"""
         <div class="card">
-            <h3>{t['remitente']}</h3>
-            <p><strong>ID:</strong> {t['id']}</p>
-            <p><strong>Monto:</strong> ${t['monto']:.2f}</p>
-            <p><strong>Estado:</strong> {t['estado']}</p>
-            <p><strong>Fecha:</strong> {t['fecha']}</p>
-            <p><strong>Estado local:</strong> {estado}</p>
-            <button class="{boton_class}" onclick="entregar('{t['id']}')">{boton}</button>
+            <h3>Remitente: {t["remitente"]}</h3>
+            <p>Monto: <b>${t["monto"]}</b></p>
+            <p>Estado: {estado}</p>
+            {boton}
         </div>
         """
 
     html += """
-        <script>
-            async function entregar(id) {
-                const res = await fetch('/marcar-entregado/' + encodeURIComponent(id), { method: 'POST' });
-                if (res.ok) {
-                    location.reload();
-                } else {
-                    alert('No se pudo actualizar la transferencia');
+            </div>
+            <script>
+                async function sincronizar() {
+                    document.getElementById('status-sync').innerHTML = '<p><i>Buscando en Mercado Pago... (esto puede tardar unos segundos)</i></p>';
+                    let res = await fetch('/sincronizar-reportes', { method: 'POST' });
+                    let data = await res.json();
+                    if(res.ok) {
+                        alert(data.message);
+                        location.reload();
+                    } else {
+                        alert('Error: ' + (data.detail || 'No se pudo sincronizar'));
+                        document.getElementById('status-sync').innerHTML = '';
+                    }
                 }
-            }
-        </script>
+
+                async function entregar(id) {
+                    let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
+                    if(res.ok) { location.reload(); } else { alert('Error al marcar'); }
+                }
+            </script>
         </body>
     </html>
     """
     return html
 
+@app.post("/sincronizar-reportes")
+async def sincronizar_reportes():
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Falta configurar el MP_ACCESS_TOKEN en Vercel")
 
-@app.post("/webhook")
-async def recibir_webhook(request: Request):
-    data = await request.json()
-    payment_id = str(data.get("data", {}).get("id", "sin_id"))
-    tipo_evento = data.get("type", "desconocido")
-
-    registro = {
-        "id": f"{payment_id} ({tipo_evento})",
-        "monto": 0.0,
-        "remitente": f"EVENTO: {tipo_evento}",
-        "estado": tipo_evento,
-        "fecha": datetime.now(timezone.utc).isoformat(),
-        "metodo": "webhook",
-        "entregado": False,
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Accept": "application/json",
     }
 
-    if not any(t["id"] == registro["id"] for t in transacciones_memoria):
-        transacciones_memoria.append(registro)
+    now = datetime.now(timezone.utc)
+    begin = now - timedelta(hours=24) # Buscamos las últimas 24 horas
 
-    return {"status": "ok"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # 1. Crear el reporte
+        payload = {"begin_date": iso_z(begin), "end_date": iso_z(now)}
+        create_resp = await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
+        
+        if create_resp.status_code not in [200, 201]:
+            raise HTTPException(status_code=400, detail=f"Error al solicitar reporte a MP: {create_resp.text}")
 
+        # 2. Buscar el archivo listo (Hacemos un par de intentos asíncronos cortos para no bloquear Vercel)
+        file_name = None
+        params = {"begin_date": iso_z(begin), "end_date": iso_z(now), "created_from": "manual", "limit": 10}
+        
+        for _ in range(3): # Intentamos 3 veces con pausa corta
+            search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
+            if search_resp.status_code == 200:
+                data = search_resp.json()
+                reports = data.get("results") or data.get("data") or []
+                for r in reports:
+                    if r.get("status") == "processed" and r.get("file_name"):
+                        file_name = r["file_name"]
+                        break
+            if file_name:
+                break
+            # Espera asíncrona de 2 segundos sin congelar el servidor
+            await httpx.AsyncClient().get("https://httpbin.org/delay/2") # o usar asyncio.sleep(2)
+            import asyncio
+            await asyncio.sleep(2)
 
-@app.post("/simular-pago")
-def simular_pago(id: str, monto: float, remitente: str):
-    transacciones_memoria.append(
-        {
-            "id": id,
-            "monto": monto,
-            "remitente": remitente,
-            "estado": "approved",
-            "fecha": datetime.now(timezone.utc).isoformat(),
-            "metodo": "simulado",
-            "entregado": False,
-        }
-    )
-    return {"message": "Simulado"}
+        if not file_name:
+            raise HTTPException(status_code=404, detail="El reporte aún se está procesando en Mercado Pago. Intentá de nuevo en un minuto.")
 
+        # 3. Descargar el CSV del reporte
+        download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
+        if download_resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
+
+        # 4. Procesar el CSV
+        text = download_resp.content.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        
+        nuevas_cantidades = 0
+        for row in reader:
+            # Acá adaptás según los nombres de columnas exactos de tu reporte de MP
+            movement_type = (row.get("MOVEMENT_TYPE") or row.get("tipo_movimiento") or "").lower()
+            
+            # Filtramos ingresos de dinero / transferencias
+            if "transfer" in movement_type or "ingress" in movement_type or "money_transfer" in movement_type:
+                p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("reference_id") or row.get("EXTERNAL_REFERENCE") or "unknown_id")
+                monto = float(row.get("AMOUNT") or row.get("transaction_amount") or row.get("monto") or 0.0)
+                remitente = row.get("COUNTERPART_NAME") or row.get("payer_name") or "Transferencia CVU"
+
+                # Evitar duplicados en memoria
+                if not any(t["id"] == p_id for t in transacciones_memoria):
+                    transacciones_memoria.append({
+                        "id": p_id,
+                        "monto": abs(monto),
+                        "remitente": remitente,
+                        "entregado": False
+                    })
+                    nuevas_cantidades += 1
+
+    return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
     for t in transacciones_memoria:
         if t["id"] == payment_id:
+            if t["entregado"]:
+                raise HTTPException(status_code=400, detail="Ya entregado.")
             t["entregado"] = True
             return {"message": "Marcado como entregado"}
-
     raise HTTPException(status_code=404, detail="No encontrado")
-
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "token_configured": bool(MP_ACCESS_TOKEN), "count": len(transacciones_memoria)}
