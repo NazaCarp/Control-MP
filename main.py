@@ -33,14 +33,14 @@ def home():
             </style>
         </head>
         <body>
-            <h1>Control de Transferencias (CVU/Alias) 💸</h1>
-            <button class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
+            <h1>Control de Transferencias (CVU/Alias) - Debug 10hs 💸</h1>
+            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Transferencias (Últimas 10hs)</button>
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias cargadas. Hacé clic en 'Buscar Nuevas Transferencias'.</p>"
+        html += "<p>No hay transferencias cargadas. Hacé clic en el botón de sincronización.</p>"
     
     for t in transacciones_memoria:
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
@@ -51,7 +51,6 @@ def home():
             <h3>Remitente: {t["remitente"]}</h3>
             <p>Monto: <b>${t["monto"]}</b></p>
             <p>Estado: {estado}</p>
-            {boton}
         </div>
         """
 
@@ -59,15 +58,30 @@ def home():
             </div>
             <script>
                 async function sincronizar() {
-                    document.getElementById('status-sync').innerHTML = '<p><i>Procesando reporte en Mercado Pago... Esto puede demorar unos segundos.</i></p>';
-                    let res = await fetch('/sincronizar-reportes', { method: 'POST' });
-                    let data = await res.json();
-                    if(res.ok) {
-                        alert(data.message);
-                        location.reload();
-                    } else {
-                        alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
-                        document.getElementById('status-sync').innerHTML = '';
+                    let btn = document.getElementById('btn-sync');
+                    let statusDiv = document.getElementById('status-sync');
+                    
+                    btn.disabled = true;
+                    btn.style.background = '#ccc';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando las últimas 10 horas en Mercado Pago...</b></p>';
+
+                    try {
+                        let res = await fetch('/sincronizar-reportes', { method: 'POST' });
+                        let data = await res.json();
+                        if(res.ok) {
+                            alert(data.message);
+                            location.reload();
+                        } else {
+                            alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
+                            statusDiv.innerHTML = '';
+                            btn.disabled = false;
+                            btn.style.background = '#28a745';
+                        }
+                    } catch (e) {
+                        alert('Error de red o timeout. Intentá de nuevo.');
+                        statusDiv.innerHTML = '';
+                        btn.disabled = false;
+                        btn.style.background = '#28a745';
                     }
                 }
 
@@ -92,12 +106,12 @@ async def sincronizar_reportes():
     }
 
     now = datetime.now(timezone.utc)
-    begin = now - timedelta(hours=24)
+    # MODIFICADO: Rango ajustado exactamente a las últimas 10 horas para debug
+    begin = now - timedelta(hours=10)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         params = {"begin_date": iso_z(begin), "end_date": iso_z(now), "created_from": "manual", "limit": 10}
         
-        # 1. Buscamos si ya hay un reporte creado previamente para evitar duplicarlo
         file_name = None
         search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
         
@@ -109,13 +123,11 @@ async def sincronizar_reportes():
                     file_name = r["file_name"]
                     break
 
-        # 2. Si no hay uno procesado, intentamos crearlo (si tira error porque ya existe uno pendiente, lo ignoramos y pasamos a buscarlo)
         if not file_name:
             payload = {"begin_date": iso_z(begin), "end_date": iso_z(now)}
             await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
 
-        # 3. Esperamos y reintentamos hasta 4 veces a que el reporte pase a estado 'processed'
-        for _ in range(4):
+        for _ in range(5):
             search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
             if search_resp.status_code == 200:
                 data = search_resp.json()
@@ -126,17 +138,15 @@ async def sincronizar_reportes():
                         break
             if file_name:
                 break
-            await asyncio.sleep(3) # Espera 3 segundos ordenadamente
+            await asyncio.sleep(4)
 
         if not file_name:
-            raise HTTPException(status_code=400, detail="El reporte sigue procesándose en los servidores de Mercado Pago[cite: 1]. Volvé a hacer clic en 'Buscar Nuevas Transferencias' en 30 segundos.")
+            raise HTTPException(status_code=400, detail="El reporte de las últimas 10hs se está generando en Mercado Pago[cite: 1]. Volvé a hacer clic en unos segundos.")
 
-        # 4. Descargamos el reporte CSV[cite: 1]
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
             raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
 
-        # 5. Procesamos la información
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         
@@ -158,7 +168,7 @@ async def sincronizar_reportes():
                     })
                     nuevas_cantidades += 1
 
-    return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
+    return {"message": f"Sincronización de 10hs exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
