@@ -2,7 +2,8 @@ import os
 import csv
 import io
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 import httpx
@@ -14,8 +15,11 @@ API_BASE = "https://api.mercadopago.com"
 
 transacciones_memoria = []
 
-def iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+# Definimos la zona horaria de Argentina
+TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
+
+def iso_arg(dt: datetime) -> str:
+    return dt.astimezone(TZ_ARG).replace(microsecond=0).isoformat()
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -46,7 +50,6 @@ def home():
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
         boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
         
-        # Eliminada la línea de Tipo / Remitente
         html += f"""
         <div class="card">
             <p>ID: {t["id"]}</p>
@@ -66,7 +69,7 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago... Por favor esperá unos segundos...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (Hora Argentina)... Por favor esperá unos segundos...</b></p>';
 
                     try {
                         let res = await fetch('/sincronizar-reportes', { method: 'POST' });
@@ -108,11 +111,12 @@ async def sincronizar_reportes():
         "Accept": "application/json",
     }
 
-    now = datetime.now(timezone.utc)
-    begin = now - timedelta(hours=10)
+    # Obtenemos la hora actual en Argentina
+    now_arg = datetime.now(TZ_ARG)
+    begin_arg = now_arg - timedelta(hours=12)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        params = {"begin_date": iso_z(begin), "end_date": iso_z(now), "created_from": "manual", "limit": 10}
+        params = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg), "created_from": "manual", "limit": 10}
         
         file_name = None
         search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
@@ -126,7 +130,7 @@ async def sincronizar_reportes():
                     break
 
         if not file_name:
-            payload = {"begin_date": iso_z(begin), "end_date": iso_z(now)}
+            payload = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg)}
             await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
 
         for _ in range(5):
