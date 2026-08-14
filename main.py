@@ -29,28 +29,24 @@ def home():
                 .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
                 .btn { background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }
                 .btn-success { background: #28a745; margin-bottom: 20px; }
-                .btn-disabled { background: #ccc; cursor: not-allowed; }
             </style>
         </head>
         <body>
-            <h1>Control de Transferencias (CVU/Alias) - Debug 10hs 💸</h1>
-            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Transferencias (Últimas 10hs)</button>
+            <h1>Control de Transferencias (Modo Debug Total) 💸</h1>
+            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Descargar TODO el reporte (10hs)</button>
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias cargadas. Hacé clic en el botón de sincronización.</p>"
+        html += "<p>No hay registros cargados. Hacé clic en el botón para inspeccionar el reporte.</p>"
     
     for t in transacciones_memoria:
-        estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
-        boton = f'<button class="btn btn-disabled" disabled>Ya entregado</button>' if t["entregado"] else f'<button class="btn" onclick="entregar(\'{t["id"]}\')">Marcar como Entregado</button>'
-        
         html += f"""
         <div class="card">
-            <h3>Remitente: {t["remitente"]}</h3>
+            <h3>Remitente / Tipo: {t["remitente"]}</h3>
+            <p>ID: {t["id"]}</p>
             <p>Monto: <b>${t["monto"]}</b></p>
-            <p>Estado: {estado}</p>
         </div>
         """
 
@@ -63,7 +59,7 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando las últimas 10 horas en Mercado Pago...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Descargando y leyendo reporte de Mercado Pago...</b></p>';
 
                     try {
                         let res = await fetch('/sincronizar-reportes', { method: 'POST' });
@@ -84,11 +80,6 @@ def home():
                         btn.style.background = '#28a745';
                     }
                 }
-
-                async function entregar(id) {
-                    let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
-                    if(res.ok) { location.reload(); } else { alert('Error al marcar'); }
-                }
             </script>
         </body>
     </html>
@@ -106,7 +97,6 @@ async def sincronizar_reportes():
     }
 
     now = datetime.now(timezone.utc)
-    # MODIFICADO: Rango ajustado exactamente a las últimas 10 horas para debug
     begin = now - timedelta(hours=10)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -141,7 +131,7 @@ async def sincronizar_reportes():
             await asyncio.sleep(4)
 
         if not file_name:
-            raise HTTPException(status_code=400, detail="El reporte de las últimas 10hs se está generando en Mercado Pago[cite: 1]. Volvé a hacer clic en unos segundos.")
+            raise HTTPException(status_code=400, detail="El reporte se está generando. Volvé a intentarlo en unos segundos.")
 
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
@@ -150,32 +140,25 @@ async def sincronizar_reportes():
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text))
         
-        nuevas_cantidades = 0
+        registros_agregados = 0
         for row in reader:
-            movement_type = (row.get("MOVEMENT_TYPE") or row.get("tipo_movimiento") or "").lower()
+            # SIN FILTROS: Capturamos cualquier columna disponible para ver qué trae el CSV
+            p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("reference_id") or row.get("EXTERNAL_REFERENCE") or "id_desconocido")
+            monto = float(row.get("AMOUNT") or row.get("transaction_amount") or row.get("monto") or 0.0)
             
-            if "transfer" in movement_type or "ingress" in movement_type or "money_transfer" in movement_type:
-                p_id = str(row.get("PAYMENT_ID") or row.get("id") or row.get("reference_id") or row.get("EXTERNAL_REFERENCE") or "unknown_id")
-                monto = float(row.get("AMOUNT") or row.get("transaction_amount") or row.get("monto") or 0.0)
-                remitente = row.get("COUNTERPART_NAME") or row.get("payer_name") or "Transferencia CVU"
+            # Intentamos leer el tipo de movimiento y contraparte de cualquier columna posible
+            tipo = row.get("MOVEMENT_TYPE") or row.get("tipo_movimiento") or row.get("OPERATION_TYPE") or "Tipo genérico"
+            contraparte = row.get("COUNTERPART_NAME") or row.get("payer_name") or row.get("DESCRIPTION") or "Sin detalle"
+            
+            remitente_texto = f"[{tipo}] - {contraparte}"
 
-                if not any(t["id"] == p_id for t in transacciones_memoria):
-                    transacciones_memoria.append({
-                        "id": p_id,
-                        "monto": abs(monto),
-                        "remitente": remitente,
-                        "entregado": False
-                    })
-                    nuevas_cantidades += 1
+            if not any(t["id"] == p_id for t in transacciones_memoria):
+                transacciones_memoria.append({
+                    "id": p_id,
+                    "monto": monto,
+                    "remitente": remitente_texto,
+                    "entregado": False
+                })
+                registros_agregados += 1
 
-    return {"message": f"Sincronización de 10hs exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
-
-@app.post("/marcar-entregado/{payment_id}")
-def marcar_entregado(payment_id: str):
-    for t in transacciones_memoria:
-        if t["id"] == payment_id:
-            if t["entregado"]:
-                raise HTTPException(status_code=400, detail="Ya entregado.")
-            t["entregado"] = True
-            return {"message": "Marcado como entregado"}
-    raise HTTPException(status_code=404, detail="No encontrado")
+    return {"message": f"Lectura completa. Se cargaron {registros_agregados} registros encontrados en el reporte."}
