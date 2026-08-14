@@ -14,12 +14,11 @@ MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 API_BASE = "https://api.mercadopago.com"
 
 transacciones_memoria = []
-
-# Definimos la zona horaria de Argentina
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 def iso_arg(dt: datetime) -> str:
-    return dt.astimezone(TZ_ARG).replace(microsecond=0).isoformat()
+    # Genera el string con la zona horaria correcta para la API de MP (-03:00)
+    return dt.astimezone(TZ_ARG).isoformat(timespec='seconds')
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -69,7 +68,7 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (Hora Argentina)... Por favor esperá unos segundos...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago... Por favor esperá unos segundos...</b></p>';
 
                     try {
                         let res = await fetch('/sincronizar-reportes', { method: 'POST' });
@@ -111,9 +110,9 @@ async def sincronizar_reportes():
         "Accept": "application/json",
     }
 
-    # Obtenemos la hora actual en Argentina
+    # Tomamos el tiempo actual de Argentina y ampliamos el rango a 24 horas para asegurar que no se pierda nada del día
     now_arg = datetime.now(TZ_ARG)
-    begin_arg = now_arg - timedelta(hours=12)
+    begin_arg = now_arg - timedelta(hours=24)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         params = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg), "created_from": "manual", "limit": 10}
@@ -166,8 +165,20 @@ async def sincronizar_reportes():
             except ValueError:
                 monto = 0.0
 
-            fecha_bruta = row.get("TRANSACTION_DATE") or "Sin fecha"
-            fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ") if "T" in fecha_bruta else fecha_bruta
+            fecha_bruta = row.get("TRANSACTION_DATE") or ""
+            
+            # Convertimos la fecha cruda de Mercado Pago al huso horario de Argentina para que coincida con tu reloj
+            if fecha_bruta:
+                try:
+                    # Parseamos la fecha que viene del CSV (remplazando la Z o interpretándola como UTC)
+                    dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
+                    # La pasamos a hora Argentina
+                    dt_arg = dt_parsed.astimezone(TZ_ARG)
+                    fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
+            else:
+                fecha_limpia = "Sin fecha"
 
             if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                 transacciones_memoria.append({
