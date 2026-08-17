@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request, Form, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import httpx
 import logging
 
@@ -16,6 +16,7 @@ API_BASE = "https://api.mercadopago.com"
 
 transacciones_memoria = []
 config_memoria = {"mp_access_token": ""}
+ultimo_json_debug = {"status": "Sin consultas previas"}
 
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -32,9 +33,10 @@ def home():
                 body {{ font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }}
                 .card {{ background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
                 .config-box {{ background: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 5px solid #009ee3; }}
-                .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
+                .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; }}
                 .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
+                .btn-debug {{ background: #6c757d; margin-left: 10px; }}
                 input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
             </style>
         </head>
@@ -50,13 +52,17 @@ def home():
                 </form>
             </div>
 
-            <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
+            <div>
+                <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
+                <a href="/debug-json" target="_blank" class="btn btn-debug">🔍 Ver JSON de Respuesta (Debug)</a>
+            </div>
+            
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias cargadas. Configurá tu token y hacé clic en 'Buscar Nuevas Transferencias'.</p>"
+        html += "<p>No hay transferencias cargadas. Configurá tu token, hacé clic en 'Buscar Nuevas Transferencias' o revisá el JSON de debug.</p>"
     
     for t in transacciones_memoria:
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
@@ -143,6 +149,11 @@ def home():
     """
     return html
 
+@app.get("/debug-json")
+def debug_json():
+    # Devuelve el último JSON crudo obtenido desde la API de Mercado Pago para inspección
+    return JSONResponse(content=ultimo_json_debug)
+
 @app.post("/configurar-token")
 async def configurar_token(token: str = Form(...)):
     token_limpio = token.strip()
@@ -174,6 +185,7 @@ async def configurar_token(token: str = Form(...)):
 
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
+    global ultimo_json_debug
     try:
         token_actual = config_memoria.get("mp_access_token")
         if not token_actual:
@@ -184,10 +196,9 @@ async def sincronizar_reportes():
             "Accept": "application/json",
         }
 
-        # Consultamos directamente la API de pagos en tiempo real (últimos 3 días)
         async with httpx.AsyncClient(timeout=30.0) as client:
             params = {
-                "limit": 30,
+                "limit": 50,
                 "sort": "date_approved",
                 "criteria": "desc"
             }
@@ -202,22 +213,22 @@ async def sincronizar_reportes():
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
             
             if resp.status_code != 200:
+                error_body = resp.text
+                ultimo_json_debug = {"http_status": resp.status_code, "error_body": error_body}
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al consultar pagos (Código {resp.status_code}).")
 
             data = resp.json()
+            # Guardamos el JSON completo para poder visualizarlo desde /debug-json
+            ultimo_json_debug = data
+
             results = data.get("results", [])
 
             nuevas_cantidades = 0
             for p in results:
                 try:
-                    # Filtramos solo pagos aprobados
-                    if p.get("status") != "approved":
-                        continue
-
                     p_id = str(p.get("id"))
                     monto = float(p.get("transaction_amount", 0))
                     
-                    # Fecha de aprobación
                     fecha_bruta = p.get("date_approved") or p.get("date_created") or ""
                     if fecha_bruta:
                         try:
