@@ -1,8 +1,7 @@
 import os
-import csv
-import io
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse
 import httpx
@@ -18,9 +17,7 @@ API_BASE = "https://api.mercadopago.com"
 transacciones_memoria = []
 config_memoria = {"mp_access_token": ""}
 
-def iso_utc(dt: datetime) -> str:
-    # Convierte a UTC exacto exigido por la API de Mercado Pago (terminado en 'Z')[cite: 3]
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -105,37 +102,22 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (generando reporte release_report)... Esperá unos segundos...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando pagos en tiempo real... Esperá un momento...</b></p>';
 
-                    let intentos = 4;
-                    let exito = false;
-
-                    for (let i = 0; i < intentos; i++) {
-                        try {
-                            let res = await fetch('/sincronizar-reportes', { method: 'POST' });
-                            let data = await res.json();
-                            
-                            if (res.ok) {
-                                alert(data.message);
-                                location.reload();
-                                exito = true;
-                                break;
-                            } else {
-                                if (i < intentos - 1) {
-                                    statusDiv.innerHTML = `<p><b>⏳ El reporte se está procesando en Mercado Pago. Reintentando automáticamente (${i + 2}/${intentos})...</b></p>`;
-                                    await new Promise(r => setTimeout(r, 6000));
-                                } else {
-                                    alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
-                                }
-                            }
-                        } catch (e) {
-                            if (i === intentos - 1) {
-                                alert('Error de red o timeout. Intentá de nuevo.');
-                            }
+                    try {
+                        let res = await fetch('/sincronizar-reportes', { method: 'POST' });
+                        let data = await res.json();
+                        if(res.ok) {
+                            alert(data.message);
+                            location.reload();
+                        } else {
+                            alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
+                            statusDiv.innerHTML = '';
+                            btn.disabled = false;
+                            btn.style.background = '#28a745';
                         }
-                    }
-
-                    if (!exito) {
+                    } catch (e) {
+                        alert('Error de red o timeout. Intentá de nuevo.');
                         statusDiv.innerHTML = '';
                         btn.disabled = false;
                         btn.style.background = '#28a745';
@@ -199,77 +181,53 @@ async def sincronizar_reportes():
 
         headers = {
             "Authorization": f"Bearer {token_actual}",
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
-        # Generar rango de fechas en UTC con sufijo Z tal como exige /v1/account/release_report[cite: 3]
-        now_utc = datetime.now(timezone.utc)
-        begin_utc = now_utc - timedelta(days=7) # Ampliamos a 7 días para asegurar captura de transferencias recientes
-
-        payload = {
-            "begin_date": iso_utc(begin_utc),
-            "end_date": iso_utc(now_utc)
-        }
-
+        # Consultamos directamente la API de pagos en tiempo real (últimos 3 días)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. Crear el reporte usando release_report según la documentación oficial[cite: 3]
-            try:
-                post_resp = await client.post(f"{API_BASE}/v1/account/release_report", json=payload, headers=headers)
-                if post_resp.status_code in (401, 403):
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado para solicitar reportes de liberación.")
-                if post_resp.status_code == 400:
-                    err_data = post_resp.json() if post_resp.content else {}
-                    logger.warning(f"Error 400 desde release_report: {err_data}")
-            except HTTPException as he:
-                raise he
-            except Exception as post_err:
-                logger.error(f"Excepción al solicitar release_report: {str(post_err)}")
-
-            # 2. Buscar/Listar los reportes generados para obtener el nombre de archivo (file_name)
-            file_name = None
-            try:
-                search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", headers=headers)
-                if search_resp.status_code == 200:
-                    reports = search_resp.json()
-                    # Si devuelve una lista o un diccionario con resultados
-                    lista_reports = reports if isinstance(reports, list) else (reports.get("results") or reports.get("data") or [])
-                    for r in lista_reports:
-                        if r.get("file_name"):
-                            file_name = r["file_name"]
-                            break
-            except Exception as search_err:
-                logger.error(f"Error al buscar reportes disponibles: {str(search_err)}")
-
-            if not file_name:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El reporte de liberación se está generando en Mercado Pago. Volvé a reintentar en unos segundos.")
-
-            # 3. Descargar el reporte usando el endpoint oficial GET /v1/account/settlement_report/{file_name}[cite: 4]
-            try:
-                download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
-            except httpx.RequestError as down_err:
-                logger.error(f"Fallo de red al descargar reporte: {str(down_err)}")
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Error de red al intentar descargar el reporte.")
-
-            if download_resp.status_code != 200:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se pudo descargar el archivo de reporte. Verificá que tu token sea correcto.")
-
-            text = download_resp.content.decode("utf-8", errors="replace")
-            reader = csv.DictReader(io.StringIO(text), delimiter=',')
+            params = {
+                "limit": 30,
+                "sort": "date_approved",
+                "criteria": "desc"
+            }
             
-            nuevas_cantidades = 0
-            for row in reader:
-                try:
-                    p_id = str(row.get("SOURCE_ID") or row.get("ID") or "")
-                    monto_str = row.get("TRANSACTION_AMOUNT") or row.get("NET_CREDIT_AMOUNT") or row.get("GROSS_AMOUNT") or "0"
-                    
-                    try:
-                        monto = float(monto_str)
-                    except ValueError:
-                        monto = 0.0
+            try:
+                resp = await client.get(f"{API_BASE}/v1/payments/search", params=params, headers=headers)
+            except httpx.RequestError as req_err:
+                logger.error(f"Fallo de conexión con Mercado Pago (payments): {str(req_err)}")
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
+            
+            if resp.status_code in (401, 403):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
+            
+            if resp.status_code != 200:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al consultar pagos (Código {resp.status_code}).")
 
-                    fecha_bruta = row.get("TRANSACTION_DATE") or row.get("DATE") or ""
-                    fecha_limpia = fecha_bruta.replace("T", " ").replace("Z", "") if fecha_bruta else "Sin fecha"
+            data = resp.json()
+            results = data.get("results", [])
+
+            nuevas_cantidades = 0
+            for p in results:
+                try:
+                    # Filtramos solo pagos aprobados
+                    if p.get("status") != "approved":
+                        continue
+
+                    p_id = str(p.get("id"))
+                    monto = float(p.get("transaction_amount", 0))
+                    
+                    # Fecha de aprobación
+                    fecha_bruta = p.get("date_approved") or p.get("date_created") or ""
+                    if fecha_bruta:
+                        try:
+                            dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
+                            dt_arg = dt_parsed.astimezone(TZ_ARG)
+                            fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
+                    else:
+                        fecha_limpia = "Sin fecha"
 
                     if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                         transacciones_memoria.append({
@@ -280,16 +238,16 @@ async def sincronizar_reportes():
                         })
                         nuevas_cantidades += 1
                 except Exception as row_err:
-                    logger.warning(f"Error procesando fila del CSV: {str(row_err)}")
+                    logger.warning(f"Error procesando un pago: {str(row_err)}")
                     continue
 
-        return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
+        return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas en tiempo real."}
 
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Error crítico en sincronización: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización con Mercado Pago.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización.")
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
