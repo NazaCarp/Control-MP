@@ -27,8 +27,8 @@ def iso_arg(dt: datetime) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home():
+    # El token se muestra visible en todo momento si existe
     token_actual = config_memoria.get("mp_access_token", "")
-    token_mascara = "••••••••••••••••••••" if token_actual else ""
 
     html = f"""
     <html>
@@ -42,7 +42,7 @@ def home():
                 .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
                 .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
-                input[type="text"] {{ padding: 8px; width: 300px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
+                input[type="text"] {{ padding: 8px; width: 400px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
             </style>
         </head>
         <body>
@@ -52,7 +52,7 @@ def home():
                 <h3>⚙️ Configuración de Credenciales</h3>
                 <form onsubmit="guardarToken(event)">
                     <label for="token">Access Token de Mercado Pago:</label><br><br>
-                    <input type="text" id="token" value="{token_mascara}" placeholder="APP_USR-..." required>
+                    <input type="text" id="token" value="{token_actual}" placeholder="APP_USR-..." required>
                     <button type="submit" class="btn">Guardar Token</button>
                 </form>
             </div>
@@ -96,7 +96,7 @@ def home():
                             alert(data.message);
                             location.reload();
                         } else {
-                            alert('Error: ' + (data.detail || 'No se pudo guardar el token.'));
+                            alert('Error: ' + (data.detail || 'Token inválido o no se pudo verificar.'));
                         }
                     } catch (err) {
                         alert('Error de red al intentar guardar el token.');
@@ -151,18 +151,35 @@ def home():
     return html
 
 @app.post("/configurar-token")
-def configurar_token(token: str = Form(...)):
-    try:
-        if not token or token.startswith("•••") or not token.strip():
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ingresá un Access Token válido.")
-        config_memoria["mp_access_token"] = token.strip()
-        logger.info("Token guardado exitosamente.")
-        return {"message": "Token guardado exitosamente en la sesión."}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Error inesperado al configurar token: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al configurar el token.")
+async def configurar_token(token: str = Form(...)):
+    token_limpio = token.strip()
+    if not token_limpio or len(token_limpio) < 10:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El token ingresado no tiene un formato válido.")
+
+    # Validar el token haciendo una petición real de prueba a Mercado Pago (ej. obtener info de usuario o permisos)
+    headers = {
+        "Authorization": f"Bearer {token_limpio}",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            # Consultamos la ruta de usuarios o una consulta ligera para validar credenciales
+            test_resp = await client.get(f"{API_BASE}/users/me", headers=headers)
+            if test_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, 
+                    detail="Token inválido o rechazado por Mercado Pago. Verificá tus credenciales."
+                )
+        except httpx.RequestError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+                detail="No se pudo conectar con Mercado Pago para validar el token."
+            )
+
+    config_memoria["mp_access_token"] = token_limpio
+    logger.info("Token validado y guardado exitosamente.")
+    return {"message": "Token verificado y guardado exitosamente."}
 
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
@@ -189,6 +206,9 @@ async def sincronizar_reportes():
                 logger.error(f"Fallo de conexión con Mercado Pago (search): {str(req_err)}")
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
             
+            if search_resp.status_code == 401 or search_resp.status_code == 403:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
+
             if search_resp.status_code == 200:
                 data = search_resp.json()
                 reports = data.get("results") or data.get("data") or []
@@ -201,8 +221,10 @@ async def sincronizar_reportes():
                 payload = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg)}
                 try:
                     post_resp = await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
-                    if post_resp.status_code not in (200, 201):
-                        logger.warning(f"Error al solicitar generación de reporte: {post_resp.status_code} - {post_resp.text}")
+                    if post_resp.status_code in (401, 403):
+                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado para solicitar reportes.")
+                except HTTPException as he:
+                    raise he
                 except Exception as post_err:
                     logger.error(f"Excepción al solicitar reporte: {str(post_err)}")
 
