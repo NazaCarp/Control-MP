@@ -42,7 +42,7 @@ def home():
                 .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
                 .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
-                input[type="text"] {{ padding: 8px; width: 400px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
+                input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
             </style>
         </head>
         <body>
@@ -109,22 +109,37 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago... Por favor esperá unos segundos...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (generando/buscando reporte)... Esperá unos segundos...</b></p>';
 
-                    try {
-                        let res = await fetch('/sincronizar-reportes', { method: 'POST' });
-                        let data = await res.json();
-                        if(res.ok) {
-                            alert(data.message);
-                            location.reload();
-                        } else {
-                            alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
-                            statusDiv.innerHTML = '';
-                            btn.disabled = false;
-                            btn.style.background = '#28a745';
+                    let intentos = 3;
+                    let exito = false;
+
+                    for (let i = 0; i < intentos; i++) {
+                        try {
+                            let res = await fetch('/sincronizar-reportes', { method: 'POST' });
+                            let data = await res.json();
+                            
+                            if (res.ok) {
+                                alert(data.message);
+                                location.reload();
+                                exito = true;
+                                break;
+                            } else {
+                                if (i < intentos - 1) {
+                                    statusDiv.innerHTML = `<p><b>⏳ El reporte se está procesando en Mercado Pago. Reintentando automáticamente (${i + 2}/${intentos})...</b></p>`;
+                                    await new Promise(r => setTimeout(r, 5000));
+                                } else {
+                                    alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
+                                }
+                            }
+                        } catch (e) {
+                            if (i === intentos - 1) {
+                                alert('Error de red o timeout. Intentá de nuevo.');
+                            }
                         }
-                    } catch (e) {
-                        alert('Error de red o timeout. Intentá de nuevo.');
+                    }
+
+                    if (!exito) {
                         statusDiv.innerHTML = '';
                         btn.disabled = false;
                         btn.style.background = '#28a745';
@@ -156,7 +171,6 @@ async def configurar_token(token: str = Form(...)):
     if not token_limpio or len(token_limpio) < 10:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El token ingresado no tiene un formato válido.")
 
-    # Validar el token haciendo una petición real de prueba a Mercado Pago (ej. obtener info de usuario o permisos)
     headers = {
         "Authorization": f"Bearer {token_limpio}",
         "Accept": "application/json",
@@ -164,7 +178,6 @@ async def configurar_token(token: str = Form(...)):
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            # Consultamos la ruta de usuarios o una consulta ligera para validar credenciales
             test_resp = await client.get(f"{API_BASE}/users/me", headers=headers)
             if test_resp.status_code != 200:
                 raise HTTPException(
@@ -206,7 +219,7 @@ async def sincronizar_reportes():
                 logger.error(f"Fallo de conexión con Mercado Pago (search): {str(req_err)}")
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
             
-            if search_resp.status_code == 401 or search_resp.status_code == 403:
+            if search_resp.status_code in (401, 403):
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
 
             if search_resp.status_code == 200:
