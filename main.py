@@ -4,9 +4,14 @@ import io
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi import FastAPI, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse
 import httpx
+import logging
+
+# Configuración de logging para registrar eventos y errores en Vercel
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -80,17 +85,21 @@ def home():
                 async function guardarToken(event) {
                     event.preventDefault();
                     let tokenVal = document.getElementById('token').value;
-                    let res = await fetch('/configurar-token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: 'token=' + encodeURIComponent(tokenVal)
-                    });
-                    let data = await res.json();
-                    if(res.ok) {
-                        alert(data.message);
-                        location.reload();
-                    } else {
-                        alert('Error: ' + data.detail);
+                    try {
+                        let res = await fetch('/configurar-token', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: 'token=' + encodeURIComponent(tokenVal)
+                        });
+                        let data = await res.json();
+                        if(res.ok) {
+                            alert(data.message);
+                            location.reload();
+                        } else {
+                            alert('Error: ' + (data.detail || 'No se pudo guardar el token.'));
+                        }
+                    } catch (err) {
+                        alert('Error de red al intentar guardar el token.');
                     }
                 }
 
@@ -123,8 +132,17 @@ def home():
                 }
 
                 async function entregar(id) {
-                    let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
-                    if(res.ok) { location.reload(); } else { alert('Error al marcar'); }
+                    try {
+                        let res = await fetch('/marcar-entregado/' + id, { method: 'POST' });
+                        let data = await res.json();
+                        if(res.ok) { 
+                            location.reload(); 
+                        } else { 
+                            alert('Error: ' + (data.detail || 'No se pudo marcar como entregado')); 
+                        }
+                    } catch (err) {
+                        alert('Error de red al intentar actualizar el estado.');
+                    }
                 }
             </script>
         </body>
@@ -134,45 +152,43 @@ def home():
 
 @app.post("/configurar-token")
 def configurar_token(token: str = Form(...)):
-    if not token or token.startswith("•••"):
-        raise HTTPException(status_code=400, detail="Ingresá un Access Token válido.")
-    config_memoria["mp_access_token"] = token.strip()
-    return {"message": "Token guardado exitosamente en la sesión."}
+    try:
+        if not token or token.startswith("•••") or not token.strip():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Ingresá un Access Token válido.")
+        config_memoria["mp_access_token"] = token.strip()
+        logger.info("Token guardado exitosamente.")
+        return {"message": "Token guardado exitosamente en la sesión."}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error inesperado al configurar token: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al configurar el token.")
 
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
-    token_actual = config_memoria.get("mp_access_token")
-    if not token_actual:
-        raise HTTPException(status_code=400, detail="Primero debés configurar tu Access Token de Mercado Pago en la interfaz.")
+    try:
+        token_actual = config_memoria.get("mp_access_token")
+        if not token_actual:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Primero debés configurar tu Access Token de Mercado Pago en la interfaz.")
 
-    headers = {
-        "Authorization": f"Bearer {token_actual}",
-        "Accept": "application/json",
-    }
+        headers = {
+            "Authorization": f"Bearer {token_actual}",
+            "Accept": "application/json",
+        }
 
-    now_arg = datetime.now(TZ_ARG)
-    begin_arg = now_arg - timedelta(hours=24)
+        now_arg = datetime.now(TZ_ARG)
+        begin_arg = now_arg - timedelta(hours=24)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        params = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg), "created_from": "manual", "limit": 10}
-        
-        file_name = None
-        search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
-        
-        if search_resp.status_code == 200:
-            data = search_resp.json()
-            reports = data.get("results") or data.get("data") or []
-            for r in reports:
-                if r.get("status") == "processed" and r.get("file_name"):
-                    file_name = r["file_name"]
-                    break
-
-        if not file_name:
-            payload = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg)}
-            await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
-
-        for _ in range(5):
-            search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            params = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg), "created_from": "manual", "limit": 10}
+            
+            file_name = None
+            try:
+                search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
+            except httpx.RequestError as req_err:
+                logger.error(f"Fallo de conexión con Mercado Pago (search): {str(req_err)}")
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
+            
             if search_resp.status_code == 200:
                 data = search_resp.json()
                 reports = data.get("results") or data.get("data") or []
@@ -180,59 +196,102 @@ async def sincronizar_reportes():
                     if r.get("status") == "processed" and r.get("file_name"):
                         file_name = r["file_name"]
                         break
-            if file_name:
-                break
-            await asyncio.sleep(4)
 
-        if not file_name:
-            raise HTTPException(status_code=400, detail="El reporte se está generando en Mercado Pago. Volvé a hacer clic en unos segundos.")
-
-        download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
-        if download_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte. Verificá que tu token sea correcto.")
-
-        text = download_resp.content.decode("utf-8", errors="replace")
-        reader = csv.DictReader(io.StringIO(text), delimiter=';')
-        
-        nuevas_cantidades = 0
-        for row in reader:
-            p_id = str(row.get("SOURCE_ID") or "")
-            monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or "0"
-            
-            try:
-                monto = float(monto_str)
-            except ValueError:
-                monto = 0.0
-
-            fecha_bruta = row.get("TRANSACTION_DATE") or ""
-            
-            if fecha_bruta:
+            if not file_name:
+                payload = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg)}
                 try:
-                    dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
-                    dt_arg = dt_parsed.astimezone(TZ_ARG)
-                    fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
+                    post_resp = await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
+                    if post_resp.status_code not in (200, 201):
+                        logger.warning(f"Error al solicitar generación de reporte: {post_resp.status_code} - {post_resp.text}")
+                except Exception as post_err:
+                    logger.error(f"Excepción al solicitar reporte: {str(post_err)}")
+
+            for _ in range(5):
+                try:
+                    search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
+                    if search_resp.status_code == 200:
+                        data = search_resp.json()
+                        reports = data.get("results") or data.get("data") or []
+                        for r in reports:
+                            if r.get("status") == "processed" and r.get("file_name"):
+                                file_name = r["file_name"]
+                                break
                 except Exception:
-                    fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
-            else:
-                fecha_limpia = "Sin fecha"
+                    pass
+                if file_name:
+                    break
+                await asyncio.sleep(4)
 
-            if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
-                transacciones_memoria.append({
-                    "id": p_id,
-                    "monto": abs(monto),
-                    "fecha": fecha_limpia,
-                    "entregado": False
-                })
-                nuevas_cantidades += 1
+            if not file_name:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El reporte se está generando en Mercado Pago. Volvé a hacer clic en unos segundos.")
 
-    return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
+            try:
+                download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
+            except httpx.RequestError as down_err:
+                logger.error(f"Fallo de conexión al descargar reporte: {str(down_err)}")
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Error de red al intentar descargar el reporte.")
+
+            if download_resp.status_code != 200:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se pudo descargar el archivo de reporte. Verificá que tu token sea correcto.")
+
+            text = download_resp.content.decode("utf-8", errors="replace")
+            reader = csv.DictReader(io.StringIO(text), delimiter=';')
+            
+            nuevas_cantidades = 0
+            for row in reader:
+                try:
+                    p_id = str(row.get("SOURCE_ID") or "")
+                    monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or "0"
+                    
+                    try:
+                        monto = float(monto_str)
+                    except ValueError:
+                        monto = 0.0
+
+                    fecha_bruta = row.get("TRANSACTION_DATE") or ""
+                    
+                    if fecha_bruta:
+                        try:
+                            dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
+                            dt_arg = dt_parsed.astimezone(TZ_ARG)
+                            fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
+                    else:
+                        fecha_limpia = "Sin fecha"
+
+                    if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
+                        transacciones_memoria.append({
+                            "id": p_id,
+                            "monto": abs(monto),
+                            "fecha": fecha_limpia,
+                            "entregado": False
+                        })
+                        nuevas_cantidades += 1
+                except Exception as row_err:
+                    logger.warning(f"Error procesando una fila del CSV: {str(row_err)}")
+                    continue
+
+        return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error crítico en sincronización: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización con Mercado Pago.")
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
-    for t in transacciones_memoria:
-        if t["id"] == payment_id:
-            if t["entregado"]:
-                raise HTTPException(status_code=400, detail="Ya entregado.")
-            t["entregado"] = True
-            return {"message": "Marcado como entregado"}
-    raise HTTPException(status_code=404, detail="No encontrado")
+    try:
+        for t in transacciones_memoria:
+            if t["id"] == payment_id:
+                if t["entregado"]:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La transacción ya figura como entregada.")
+                t["entregado"] = True
+                return {"message": "Marcado como entregado correctamente."}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transacción no encontrada.")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error al marcar como entregado ({payment_id}): {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al actualizar el estado de la transacción.")
