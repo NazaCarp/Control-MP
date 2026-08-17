@@ -2,14 +2,12 @@ import os
 import csv
 import io
 import asyncio
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse
 import httpx
 import logging
 
-# Configuración de logging para registrar eventos y errores en Vercel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -20,14 +18,12 @@ API_BASE = "https://api.mercadopago.com"
 transacciones_memoria = []
 config_memoria = {"mp_access_token": ""}
 
-TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
-
-def iso_arg(dt: datetime) -> str:
-    return dt.astimezone(TZ_ARG).isoformat(timespec='seconds')
+def iso_utc(dt: datetime) -> str:
+    # Convierte a UTC exacto exigido por la API de Mercado Pago (terminado en 'Z')[cite: 3]
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # El token se muestra visible en todo momento si existe
     token_actual = config_memoria.get("mp_access_token", "")
 
     html = f"""
@@ -109,9 +105,9 @@ def home():
                     
                     btn.disabled = true;
                     btn.style.background = '#ccc';
-                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (generando/buscando reporte)... Esperá unos segundos...</b></p>';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando a Mercado Pago (generando reporte release_report)... Esperá unos segundos...</b></p>';
 
-                    let intentos = 3;
+                    let intentos = 4;
                     let exito = false;
 
                     for (let i = 0; i < intentos; i++) {
@@ -127,7 +123,7 @@ def home():
                             } else {
                                 if (i < intentos - 1) {
                                     statusDiv.innerHTML = `<p><b>⏳ El reporte se está procesando en Mercado Pago. Reintentando automáticamente (${i + 2}/${intentos})...</b></p>`;
-                                    await new Promise(r => setTimeout(r, 5000));
+                                    await new Promise(r => setTimeout(r, 6000));
                                 } else {
                                     alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
                                 }
@@ -203,97 +199,77 @@ async def sincronizar_reportes():
 
         headers = {
             "Authorization": f"Bearer {token_actual}",
+            "Content-Type": "application/json",
             "Accept": "application/json",
         }
 
-        now_arg = datetime.now(TZ_ARG)
-        begin_arg = now_arg - timedelta(hours=24)
+        # Generar rango de fechas en UTC con sufijo Z tal como exige /v1/account/release_report[cite: 3]
+        now_utc = datetime.now(timezone.utc)
+        begin_utc = now_utc - timedelta(days=7) # Ampliamos a 7 días para asegurar captura de transferencias recientes
+
+        payload = {
+            "begin_date": iso_utc(begin_utc),
+            "end_date": iso_utc(now_utc)
+        }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            params = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg), "created_from": "manual", "limit": 10}
-            
+            # 1. Crear el reporte usando release_report según la documentación oficial[cite: 3]
+            try:
+                post_resp = await client.post(f"{API_BASE}/v1/account/release_report", json=payload, headers=headers)
+                if post_resp.status_code in (401, 403):
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado para solicitar reportes de liberación.")
+                if post_resp.status_code == 400:
+                    err_data = post_resp.json() if post_resp.content else {}
+                    logger.warning(f"Error 400 desde release_report: {err_data}")
+            except HTTPException as he:
+                raise he
+            except Exception as post_err:
+                logger.error(f"Excepción al solicitar release_report: {str(post_err)}")
+
+            # 2. Buscar/Listar los reportes generados para obtener el nombre de archivo (file_name)
             file_name = None
             try:
-                search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
-            except httpx.RequestError as req_err:
-                logger.error(f"Fallo de conexión con Mercado Pago (search): {str(req_err)}")
-                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
-            
-            if search_resp.status_code in (401, 403):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
-
-            if search_resp.status_code == 200:
-                data = search_resp.json()
-                reports = data.get("results") or data.get("data") or []
-                for r in reports:
-                    if r.get("status") == "processed" and r.get("file_name"):
-                        file_name = r["file_name"]
-                        break
+                search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", headers=headers)
+                if search_resp.status_code == 200:
+                    reports = search_resp.json()
+                    # Si devuelve una lista o un diccionario con resultados
+                    lista_reports = reports if isinstance(reports, list) else (reports.get("results") or reports.get("data") or [])
+                    for r in lista_reports:
+                        if r.get("file_name"):
+                            file_name = r["file_name"]
+                            break
+            except Exception as search_err:
+                logger.error(f"Error al buscar reportes disponibles: {str(search_err)}")
 
             if not file_name:
-                payload = {"begin_date": iso_arg(begin_arg), "end_date": iso_arg(now_arg)}
-                try:
-                    post_resp = await client.post(f"{API_BASE}/v1/account/settlement_report", json=payload, headers=headers)
-                    if post_resp.status_code in (401, 403):
-                        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado para solicitar reportes.")
-                except HTTPException as he:
-                    raise he
-                except Exception as post_err:
-                    logger.error(f"Excepción al solicitar reporte: {str(post_err)}")
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El reporte de liberación se está generando en Mercado Pago. Volvé a reintentar en unos segundos.")
 
-            for _ in range(5):
-                try:
-                    search_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/search", params=params, headers=headers)
-                    if search_resp.status_code == 200:
-                        data = search_resp.json()
-                        reports = data.get("results") or data.get("data") or []
-                        for r in reports:
-                            if r.get("status") == "processed" and r.get("file_name"):
-                                file_name = r["file_name"]
-                                break
-                except Exception:
-                    pass
-                if file_name:
-                    break
-                await asyncio.sleep(4)
-
-            if not file_name:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El reporte se está generando en Mercado Pago. Volvé a hacer clic en unos segundos.")
-
+            # 3. Descargar el reporte usando el endpoint oficial GET /v1/account/settlement_report/{file_name}[cite: 4]
             try:
                 download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
             except httpx.RequestError as down_err:
-                logger.error(f"Fallo de conexión al descargar reporte: {str(down_err)}")
+                logger.error(f"Fallo de red al descargar reporte: {str(down_err)}")
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Error de red al intentar descargar el reporte.")
 
             if download_resp.status_code != 200:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se pudo descargar el archivo de reporte. Verificá que tu token sea correcto.")
 
             text = download_resp.content.decode("utf-8", errors="replace")
-            reader = csv.DictReader(io.StringIO(text), delimiter=';')
+            reader = csv.DictReader(io.StringIO(text), delimiter=',')
             
             nuevas_cantidades = 0
             for row in reader:
                 try:
-                    p_id = str(row.get("SOURCE_ID") or "")
-                    monto_str = row.get("TRANSACTION_AMOUNT") or row.get("REAL_AMOUNT") or "0"
+                    p_id = str(row.get("SOURCE_ID") or row.get("ID") or "")
+                    monto_str = row.get("TRANSACTION_AMOUNT") or row.get("NET_CREDIT_AMOUNT") or row.get("GROSS_AMOUNT") or "0"
                     
                     try:
                         monto = float(monto_str)
                     except ValueError:
                         monto = 0.0
 
-                    fecha_bruta = row.get("TRANSACTION_DATE") or ""
-                    
-                    if fecha_bruta:
-                        try:
-                            dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
-                            dt_arg = dt_parsed.astimezone(TZ_ARG)
-                            fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
-                    else:
-                        fecha_limpia = "Sin fecha"
+                    fecha_bruta = row.get("TRANSACTION_DATE") or row.get("DATE") or ""
+                    fecha_limpia = fecha_bruta.replace("T", " ").replace("Z", "") if fecha_bruta else "Sin fecha"
 
                     if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                         transacciones_memoria.append({
@@ -304,7 +280,7 @@ async def sincronizar_reportes():
                         })
                         nuevas_cantidades += 1
                 except Exception as row_err:
-                    logger.warning(f"Error procesando una fila del CSV: {str(row_err)}")
+                    logger.warning(f"Error procesando fila del CSV: {str(row_err)}")
                     continue
 
         return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas."}
