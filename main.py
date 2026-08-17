@@ -4,61 +4,46 @@ import io
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, HTTPException, Request, Form
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 import httpx
 
 app = FastAPI()
 
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 API_BASE = "https://api.mercadopago.com"
 
 transacciones_memoria = []
-config_memoria = {"mp_access_token": ""}
-
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 def iso_arg(dt: datetime) -> str:
+    # Genera el string con la zona horaria correcta para la API de MP (-03:00)
     return dt.astimezone(TZ_ARG).isoformat(timespec='seconds')
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    token_actual = config_memoria.get("mp_access_token", "")
-    token_mascara = "••••••••••••••••••••" if token_actual else ""
-
-    html = f"""
+    html = """
     <html>
         <head>
             <title>Control de Transferencias - MP</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
-                body {{ font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }}
-                .card {{ background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                .config-box {{ background: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 5px solid #009ee3; }}
-                .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
-                .btn-success {{ background: #28a745; margin-bottom: 20px; }}
-                .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
-                input[type="text"] {{ padding: 8px; width: 300px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
+                body { font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }
+                .card { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .btn { background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }
+                .btn-success { background: #28a745; margin-bottom: 20px; }
+                .btn-disabled { background: #ccc; cursor: not-allowed; }
             </style>
         </head>
         <body>
             <h1>Control de Transferencias (CVU/Alias) 💸</h1>
-            
-            <div class="config-box">
-                <h3>⚙️ Configuración de Credenciales</h3>
-                <form onsubmit="guardarToken(event)">
-                    <label for="token">Access Token de Mercado Pago:</label><br><br>
-                    <input type="text" id="token" value="{token_mascara}" placeholder="APP_USR-..." required>
-                    <button type="submit" class="btn">Guardar Token</button>
-                </form>
-            </div>
-
             <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
             <div id="status-sync"></div>
             <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias cargadas. Configurá tu token y hacé clic en 'Buscar Nuevas Transferencias'.</p>"
+        html += "<p>No hay transferencias cargadas. Hacé clic en 'Buscar Nuevas Transferencias'.</p>"
     
     for t in transacciones_memoria:
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
@@ -77,23 +62,6 @@ def home():
     html += """
             </div>
             <script>
-                async function guardarToken(event) {
-                    event.preventDefault();
-                    let tokenVal = document.getElementById('token').value;
-                    let res = await fetch('/configurar-token', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: 'token=' + encodeURIComponent(tokenVal)
-                    });
-                    let data = await res.json();
-                    if(res.ok) {
-                        alert(data.message);
-                        location.reload();
-                    } else {
-                        alert('Error: ' + data.detail);
-                    }
-                }
-
                 async function sincronizar() {
                     let btn = document.getElementById('btn-sync');
                     let statusDiv = document.getElementById('status-sync');
@@ -132,24 +100,17 @@ def home():
     """
     return html
 
-@app.post("/configurar-token")
-def configurar_token(token: str = Form(...)):
-    if not token or token.startswith("•••"):
-        raise HTTPException(status_code=400, detail="Ingresá un Access Token válido.")
-    config_memoria["mp_access_token"] = token.strip()
-    return {"message": "Token guardado exitosamente en la sesión."}
-
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
-    token_actual = config_memoria.get("mp_access_token")
-    if not token_actual:
-        raise HTTPException(status_code=400, detail="Primero debés configurar tu Access Token de Mercado Pago en la interfaz.")
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Falta configurar el MP_ACCESS_TOKEN en Vercel")
 
     headers = {
-        "Authorization": f"Bearer {token_actual}",
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Accept": "application/json",
     }
 
+    # Tomamos el tiempo actual de Argentina y ampliamos el rango a 24 horas para asegurar que no se pierda nada del día
     now_arg = datetime.now(TZ_ARG)
     begin_arg = now_arg - timedelta(hours=24)
 
@@ -189,7 +150,7 @@ async def sincronizar_reportes():
 
         download_resp = await client.get(f"{API_BASE}/v1/account/settlement_report/{file_name}", headers=headers)
         if download_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte. Verificá que tu token sea correcto.")
+            raise HTTPException(status_code=400, detail="No se pudo descargar el archivo de reporte.")
 
         text = download_resp.content.decode("utf-8", errors="replace")
         reader = csv.DictReader(io.StringIO(text), delimiter=';')
@@ -206,9 +167,12 @@ async def sincronizar_reportes():
 
             fecha_bruta = row.get("TRANSACTION_DATE") or ""
             
+            # Convertimos la fecha cruda de Mercado Pago al huso horario de Argentina para que coincida con tu reloj
             if fecha_bruta:
                 try:
+                    # Parseamos la fecha que viene del CSV (remplazando la Z o interpretándola como UTC)
                     dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
+                    # La pasamos a hora Argentina
                     dt_arg = dt_parsed.astimezone(TZ_ARG)
                     fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
