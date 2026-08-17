@@ -12,10 +12,8 @@ app = FastAPI()
 
 API_BASE = "https://api.mercadopago.com"
 
-# Estructuras en memoria
 transacciones_memoria = []
-# Guardaremos el token ingresado por el usuario temporalmente en memoria del servidor
-config_memoria = {"mp_access_token": os.getenv("MP_ACCESS_TOKEN", "")}
+config_memoria = {"mp_access_token": ""}
 
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
@@ -45,7 +43,6 @@ def home():
         <body>
             <h1>Control de Transferencias (CVU/Alias) 💸</h1>
             
-            <!-- Panel de Configuración de Token Personal -->
             <div class="config-box">
                 <h3>⚙️ Configuración de Credenciales</h3>
                 <form onsubmit="guardarToken(event)">
@@ -83,7 +80,6 @@ def home():
                 async function guardarToken(event) {
                     event.preventDefault();
                     let tokenVal = document.getElementById('token').value;
-                    // Si contiene puntos suspensivos, asumimos que no lo modificó, pero si puso uno nuevo lo guardamos
                     let res = await fetch('/configurar-token', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
