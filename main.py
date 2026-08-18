@@ -1,3 +1,29 @@
+from datetime import datetime
+import logging
+from zoneinfo import ZoneInfo
+import httpx
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+# Configuración de logging e instancia principal requerida por Vercel
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# Configuración de zona horaria para Argentina
+TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
+API_BASE = "https://api.mercadopago.com"
+
+# Almacenamiento en memoria volátil (Serverless)
+config_memoria = {
+    "mp_access_token": ""
+}
+
+transacciones_memoria = []
+ultimo_json_debug = {}
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     token_actual = config_memoria.get("mp_access_token", "")
@@ -128,6 +154,16 @@ def home():
     """
     return html
 
+@app.post("/configurar-token")
+async def configurar_token(request: Request):
+    form = await request.form()
+    token = form.get("token")
+    if not token:
+        raise HTTPException(status_code=400, detail="El token no puede estar vacío.")
+    
+    config_memoria["mp_access_token"] = token.strip()
+    return {"message": "Token guardado correctamente en memoria."}
+
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
     global ultimo_json_debug
@@ -219,3 +255,15 @@ async def sincronizar_reportes():
     except Exception as e:
         logger.error(f"Error crítico en sincronización: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización.")
+
+@app.post("/marcar-entregado/{pago_id}")
+async def marcar_entregado(pago_id: str):
+    for t in transacciones_memoria:
+        if t["id"] == pago_id:
+            t["entregado"] = True
+            return {"message": "Estado actualizado correctamente."}
+    raise HTTPException(status_code=404, detail="Transacción no encontrada.")
+
+@app.get("/debug-json")
+def debug_json():
+    return ultimo_json_debug
