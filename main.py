@@ -1,5 +1,6 @@
 import os
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -13,15 +14,14 @@ app = FastAPI()
 
 API_BASE = "https://api.mercadopago.com"
 
-# Almacenamiento en memoria de las transferencias notificadas
 transacciones_memoria = []
 config_memoria = {"mp_access_token": ""}
+ultimo_json_debug = {"status": "Sin consultas previas"}
 
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Recuperamos el token actual guardado en memoria para mostrarlo en el input
     token_actual = config_memoria.get("mp_access_token", "")
 
     html = f"""
@@ -33,10 +33,10 @@ def home():
                 body {{ font-family: Arial; margin: 20px; background: #f4f4f9; color: #333; }}
                 .card {{ background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
                 .config-box {{ background: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 5px solid #009ee3; }}
-                .info-box {{ background: #e7f3fe; border-left: 5px solid #2196F3; padding: 15px; margin-bottom: 20px; border-radius: 8px; }}
                 .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; }}
-                .btn-success {{ background: #28a745; }}
+                .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
+                .btn-debug {{ background: #6c757d; margin-left: 10px; }}
                 input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
             </style>
         </head>
@@ -52,18 +52,17 @@ def home():
                 </form>
             </div>
 
-            <div class="info-box">
-                <h3>📢 Configuración de Webhooks en Mercado Pago</h3>
-                <p>Para recibir transferencias por CVU/Alias automáticamente en tiempo real, configurá en tu panel de desarrollador de Mercado Pago la URL de notificación (Webhook) apuntando a:</p>
-                <p><b>https://tu-dominio.vercel.app/webhook</b></p>
-                <p><i>(Tipos de eventos a suscribir: <code>payment</code>)</i></p>
+            <div>
+                <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
+                <a href="/debug-json" target="_blank" class="btn btn-debug">🔍 Ver JSON de Respuesta (Debug)</a>
             </div>
             
-            <h3>📋 Transferencias Registradas</h3>
+            <div id="status-sync"></div>
+            <div id="panel">
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias registradas todavía. Las transferencias aparecerán aquí automáticamente en cuanto lleguen las notificaciones de Mercado Pago.</p>"
+        html += "<p>No hay transferencias cargadas. Configurá tu token, hacé clic en 'Buscar Nuevas Transferencias' o revisá el JSON de debug.</p>"
     
     for t in transacciones_memoria:
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
@@ -71,7 +70,7 @@ def home():
         
         html += f"""
         <div class="card">
-            <p>ID / Operación: <b>{t["id"]}</b></p>
+            <p>ID: {t["id"]}</p>
             <p>Fecha: <b>{t["fecha"]}</b></p>
             <p>Monto: <b>${t["monto"]}</b></p>
             <p>Estado: {estado}</p>
@@ -80,6 +79,7 @@ def home():
         """
 
     html += """
+            </div>
             <script>
                 async function guardarToken(event) {
                     event.preventDefault();
@@ -95,10 +95,38 @@ def home():
                             alert(data.message);
                             location.reload();
                         } else {
-                            alert('Error: ' + (data.detail || 'Token inválido.'));
+                            alert('Error: ' + (data.detail || 'Token inválido o no se pudo verificar.'));
                         }
                     } catch (err) {
-                        alert('Error de red al guardar el token.');
+                        alert('Error de red al intentar guardar el token.');
+                    }
+                }
+
+                async function sincronizar() {
+                    let btn = document.getElementById('btn-sync');
+                    let statusDiv = document.getElementById('status-sync');
+                    
+                    btn.disabled = true;
+                    btn.style.background = '#ccc';
+                    statusDiv.innerHTML = '<p><b>⏳ Consultando pagos en tiempo real... Esperá un momento...</b></p>';
+
+                    try {
+                        let res = await fetch('/sincronizar-reportes', { method: 'POST' });
+                        let data = await res.json();
+                        if(res.ok) {
+                            alert(data.message);
+                            location.reload();
+                        } else {
+                            alert('Aviso: ' + (data.detail || 'Error al sincronizar'));
+                            statusDiv.innerHTML = '';
+                            btn.disabled = false;
+                            btn.style.background = '#28a745';
+                        }
+                    } catch (e) {
+                        alert('Error de red o timeout. Intentá de nuevo.');
+                        statusDiv.innerHTML = '';
+                        btn.disabled = false;
+                        btn.style.background = '#28a745';
                     }
                 }
 
@@ -109,10 +137,10 @@ def home():
                         if(res.ok) { 
                             location.reload(); 
                         } else { 
-                            alert('Error: ' + (data.detail || 'No se pudo actualizar')); 
+                            alert('Error: ' + (data.detail || 'No se pudo marcar como entregado')); 
                         }
                     } catch (err) {
-                        alert('Error de red.');
+                        alert('Error de red al intentar actualizar el estado.');
                     }
                 }
             </script>
@@ -121,78 +149,129 @@ def home():
     """
     return html
 
+@app.get("/debug-json")
+def debug_json():
+    # Devuelve el último JSON crudo obtenido desde la API de Mercado Pago para inspección
+    return JSONResponse(content=ultimo_json_debug)
+
 @app.post("/configurar-token")
 async def configurar_token(token: str = Form(...)):
     token_limpio = token.strip()
     if not token_limpio or len(token_limpio) < 10:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no válido.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El token ingresado no tiene un formato válido.")
 
-    headers = {"Authorization": f"Bearer {token_limpio}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token_limpio}",
+        "Accept": "application/json",
+    }
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             test_resp = await client.get(f"{API_BASE}/users/me", headers=headers)
             if test_resp.status_code != 200:
-                raise HTTPException(status_code=400, detail="Token rechazado por Mercado Pago.")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, 
+                    detail="Token inválido o rechazado por Mercado Pago. Verificá tus credenciales."
+                )
         except httpx.RequestError:
-            raise HTTPException(status_code=503, detail="Error de conexión con Mercado Pago.")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+                detail="No se pudo conectar con Mercado Pago para validar el token."
+            )
 
     config_memoria["mp_access_token"] = token_limpio
+    logger.info("Token validado y guardado exitosamente.")
     return {"message": "Token verificado y guardado exitosamente."}
 
-@app.post("/webhook")
-async def recibir_webhook(request: Request):
-    """Endpoint oficial que recibe las notificaciones instantáneas de Mercado Pago"""
+@app.post("/sincronizar-reportes")
+async def sincronizar_reportes():
+    global ultimo_json_debug
     try:
-        body = await request.json()
-        logger.info(f"Webhook recibido de MP: {body}")
+        token_actual = config_memoria.get("mp_access_token")
+        if not token_actual:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Primero debés configurar tu Access Token de Mercado Pago en la interfaz.")
 
-        action = body.get("action")
-        data = body.get("data", {})
-        payment_id = data.get("id")
+        headers = {
+            "Authorization": f"Bearer {token_actual}",
+            "Accept": "application/json",
+        }
 
-        if payment_id and (action == "payment.created" or action == "payment.updated" or body.get("type") == "payment"):
-            token_actual = config_memoria.get("mp_access_token")
-            if not token_actual:
-                return {"status": "ignored_no_token"}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            params = {
+                "limit": 50,
+                "sort": "date_approved",
+                "criteria": "desc"
+            }
+            
+            try:
+                resp = await client.get(f"{API_BASE}/v1/payments/search", params=params, headers=headers)
+            except httpx.RequestError as req_err:
+                logger.error(f"Fallo de conexión con Mercado Pago (payments): {str(req_err)}")
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No se pudo conectar con los servidores de Mercado Pago.")
+            
+            if resp.status_code in (401, 403):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no autorizado o vencido. Verificá tus credenciales.")
+            
+            if resp.status_code != 200:
+                error_body = resp.text
+                ultimo_json_debug = {"http_status": resp.status_code, "error_body": error_body}
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Error al consultar pagos (Código {resp.status_code}).")
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                headers = {"Authorization": f"Bearer {token_actual}", "Accept": "application/json"}
-                resp = await client.get(f"{API_BASE}/v1/payments/{payment_id}", headers=headers)
-                
-                if resp.status_code == 200:
-                    p = resp.json()
-                    if p.get("status") == "approved":
-                        p_id = str(p.get("id"))
-                        monto = float(p.get("transaction_amount", 0))
-                        
-                        fecha_bruta = p.get("date_approved") or p.get("date_created") or ""
+            data = resp.json()
+            # Guardamos el JSON completo para poder visualizarlo desde /debug-json
+            ultimo_json_debug = data
+
+            results = data.get("results", [])
+
+            nuevas_cantidades = 0
+            for p in results:
+                try:
+                    p_id = str(p.get("id"))
+                    monto = float(p.get("transaction_amount", 0))
+                    
+                    fecha_bruta = p.get("date_approved") or p.get("date_created") or ""
+                    if fecha_bruta:
                         try:
                             dt_parsed = datetime.fromisoformat(fecha_bruta.replace("Z", "+00:00"))
                             dt_arg = dt_parsed.astimezone(TZ_ARG)
                             fecha_limpia = dt_arg.strftime("%Y-%m-%d %H:%M:%S")
                         except Exception:
                             fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
+                    else:
+                        fecha_limpia = "Sin fecha"
 
-                        if p_id and not any(t["id"] == p_id for t in transacciones_memoria):
-                            transacciones_memoria.append({
-                                "id": p_id,
-                                "monto": abs(monto),
-                                "fecha": fecha_limpia or "Hace un momento",
-                                "entregado": False
-                            })
-                            logger.info(f"¡Transferencia registrada exitosamente! ID: {p_id} - Monto: ${monto}")
+                    if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
+                        transacciones_memoria.append({
+                            "id": p_id,
+                            "monto": abs(monto),
+                            "fecha": fecha_limpia,
+                            "entregado": False
+                        })
+                        nuevas_cantidades += 1
+                except Exception as row_err:
+                    logger.warning(f"Error procesando un pago: {str(row_err)}")
+                    continue
 
-        return {"status": "ok"}
+        return {"message": f"Sincronización exitosa. Se encontraron {nuevas_cantidades} transferencias nuevas en tiempo real."}
+
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        logger.error(f"Error procesando webhook: {str(e)}")
-        return {"status": "error"}
+        logger.error(f"Error crítico en sincronización: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización.")
 
 @app.post("/marcar-entregado/{payment_id}")
 def marcar_entregado(payment_id: str):
-    for t in transacciones_memoria:
-        if t["id"] == payment_id:
-            if t["entregado"]:
-                raise HTTPException(status_code=400, detail="Ya fue entregado.")
-            t["entregado"] = True
-            return {"message": "Actualizado correctamente."}
-    raise HTTPException(status_code=404, detail="No encontrado.")
+    try:
+        for t in transacciones_memoria:
+            if t["id"] == payment_id:
+                if t["entregado"]:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La transacción ya figura como entregada.")
+                t["entregado"] = True
+                return {"message": "Marcado como entregado correctamente."}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transacción no encontrada.")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error al marcar como entregado ({payment_id}): {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al actualizar el estado de la transacción.")
