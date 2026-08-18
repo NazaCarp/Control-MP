@@ -21,6 +21,7 @@ TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 @app.get("/", response_class=HTMLResponse)
 def home():
+    # Recuperamos el token actual guardado en memoria para mostrarlo en el input
     token_actual = config_memoria.get("mp_access_token", "")
 
     html = f"""
@@ -149,13 +150,11 @@ async def recibir_webhook(request: Request):
         data = body.get("data", {})
         payment_id = data.get("id")
 
-        # Si el evento es de pago creado/actualizado
         if payment_id and (action == "payment.created" or action == "payment.updated" or body.get("type") == "payment"):
             token_actual = config_memoria.get("mp_access_token")
             if not token_actual:
                 return {"status": "ignored_no_token"}
 
-            # Consultamos los detalles específicos de ese pago mediante la API
             async with httpx.AsyncClient(timeout=10.0) as client:
                 headers = {"Authorization": f"Bearer {token_actual}", "Accept": "application/json"}
                 resp = await client.get(f"{API_BASE}/v1/payments/{payment_id}", headers=headers)
@@ -174,7 +173,6 @@ async def recibir_webhook(request: Request):
                         except Exception:
                             fecha_limpia = fecha_bruta.split(".")[0].replace("T", " ")
 
-                        # Evitar duplicados
                         if p_id and not any(t["id"] == p_id for t in transacciones_memoria):
                             transacciones_memoria.append({
                                 "id": p_id,
