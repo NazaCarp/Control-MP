@@ -38,7 +38,7 @@ def home():
                 .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
                 .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
-                input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; background-color: #e9ecef; color: #495057; }}
+                input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; background-color: #fff; color: #333; }}
             </style>
         </head>
         <body>
@@ -47,8 +47,9 @@ def home():
             <div class="config-box">
                 <h3>⚙️ Credenciales (Variables de Entorno de Vercel)</h3>
                 <label for="token">Access Token configurado:</label><br><br>
-                <input type="text" id="token" value="{token_actual}" placeholder="No configurado en Vercel..." readonly>
-                <p style="font-size: 13px; color: #666; margin-top: 5px;"><i>Este valor se carga automáticamente desde las Environment Variables de tu proyecto en Vercel.</i></p>
+                <!-- Input editable y seleccionable para copiar el valor -->
+                <input type="text" id="token" value="{token_actual}" placeholder="No configurado en Vercel...">
+                <p style="font-size: 13px; color: #666; margin-top: 5px;"><i>Este valor se carga automáticamente desde las Environment Variables de tu proyecto en Vercel y podés seleccionarlo, editarlo o copiarlo.</i></p>
             </div>
 
             <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
