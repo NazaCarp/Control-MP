@@ -4,16 +4,17 @@ import io
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, HTTPException, Request, Form, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 import httpx
 
 app = FastAPI()
 
+# Leemos el token directamente desde las variables de entorno de Vercel
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
 API_BASE = "https://api.mercadopago.com"
 
 transacciones_memoria = []
-config_memoria = {"mp_access_token": ""}
 TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
 
 def iso_arg(dt: datetime) -> str:
@@ -22,8 +23,8 @@ def iso_arg(dt: datetime) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Recuperamos el token actual almacenado en memoria para mostrarlo en el input
-    token_actual = config_memoria.get("mp_access_token", "")
+    # Mostramos en el input el token que viene de la variable de entorno de Vercel
+    token_actual = MP_ACCESS_TOKEN
 
     html = f"""
     <html>
@@ -37,19 +38,17 @@ def home():
                 .btn {{ background: #009ee3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 16px; }}
                 .btn-success {{ background: #28a745; margin-bottom: 20px; }}
                 .btn-disabled {{ background: #ccc; cursor: not-allowed; }}
-                input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }}
+                input[type="text"] {{ padding: 8px; width: 450px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; background-color: #e9ecef; color: #495057; }}
             </style>
         </head>
         <body>
             <h1>Control de Transferencias (CVU/Alias) 💸</h1>
             
             <div class="config-box">
-                <h3>⚙️ Configuración de Credenciales</h3>
-                <form onsubmit="guardarToken(event)">
-                    <label for="token">Access Token de Mercado Pago:</label><br><br>
-                    <input type="text" id="token" value="{token_actual}" placeholder="APP_USR-..." required>
-                    <button type="submit" class="btn">Guardar Token</button>
-                </form>
+                <h3>⚙️ Credenciales (Variables de Entorno de Vercel)</h3>
+                <label for="token">Access Token configurado:</label><br><br>
+                <input type="text" id="token" value="{token_actual}" placeholder="No configurado en Vercel..." readonly>
+                <p style="font-size: 13px; color: #666; margin-top: 5px;"><i>Este valor se carga automáticamente desde las Environment Variables de tu proyecto en Vercel.</i></p>
             </div>
 
             <button id="btn-sync" class="btn btn-success" onclick="sincronizar()">🔄 Buscar Nuevas Transferencias</button>
@@ -58,7 +57,7 @@ def home():
     """
     
     if not transacciones_memoria:
-        html += "<p>No hay transferencias cargadas. Configurá tu token y hacé clic en 'Buscar Nuevas Transferencias'.</p>"
+        html += "<p>No hay transferencias cargadas. Hacé clic en 'Buscar Nuevas Transferencias'.</p>"
     
     for t in transacciones_memoria:
         estado = "✅ ENTREGADO" if t["entregado"] else "⏳ DISPONIBLE PARA RETIRAR"
@@ -77,27 +76,6 @@ def home():
     html += """
             </div>
             <script>
-                async function guardarToken(event) {
-                    event.preventDefault();
-                    let tokenVal = document.getElementById('token').value;
-                    try {
-                        let res = await fetch('/configurar-token', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                            body: 'token=' + encodeURIComponent(tokenVal)
-                        });
-                        let data = await res.json();
-                        if(res.ok) {
-                            alert(data.message);
-                            location.reload();
-                        } else {
-                            alert('Error: ' + (data.detail || 'Token inválido.'));
-                        }
-                    } catch (err) {
-                        alert('Error de red al intentar guardar el token.');
-                    }
-                }
-
                 async function sincronizar() {
                     let btn = document.getElementById('btn-sync');
                     let statusDiv = document.getElementById('status-sync');
@@ -136,33 +114,13 @@ def home():
     """
     return html
 
-@app.post("/configurar-token")
-async def configurar_token(token: str = Form(...)):
-    token_limpio = token.strip()
-    if not token_limpio or len(token_limpio) < 10:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token no válido.")
-
-    # Validamos opcionalmente que el token sea correcto consultando a MP
-    headers = {"Authorization": f"Bearer {token_limpio}", "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            test_resp = await client.get(f"{API_BASE}/users/me", headers=headers)
-            if test_resp.status_code != 200:
-                raise HTTPException(status_code=400, detail="Token rechazado por Mercado Pago.")
-        except httpx.RequestError:
-            raise HTTPException(status_code=503, detail="Error de conexión con Mercado Pago.")
-
-    config_memoria["mp_access_token"] = token_limpio
-    return {"message": "Token guardado exitosamente en la sesión."}
-
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
-    token_actual = config_memoria.get("mp_access_token") or os.getenv("MP_ACCESS_TOKEN")
-    if not token_actual:
-        raise HTTPException(status_code=400, detail="Primero debés configurar y guardar tu Access Token en la interfaz.")
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Falta configurar la variable de entorno MP_ACCESS_TOKEN en Vercel")
 
     headers = {
-        "Authorization": f"Bearer {token_actual}",
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Accept": "application/json",
     }
 
