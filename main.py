@@ -1,28 +1,5 @@
-import os
-import asyncio
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from fastapi import FastAPI, HTTPException, Request, Form, status
-from fastapi.responses import HTMLResponse, JSONResponse
-import httpx
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI()
-
-API_BASE = "https://api.mercadopago.com"
-
-transacciones_memoria = []
-config_memoria = {"mp_access_token": ""}
-ultimo_json_debug = {"status": "Sin consultas previas"}
-
-TZ_ARG = ZoneInfo("America/Argentina/Buenos_Aires")
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Recuperamos el token almacenado para mostrarlo en el input
     token_actual = config_memoria.get("mp_access_token", "")
 
     html = f"""
@@ -72,6 +49,7 @@ def home():
         html += f"""
         <div class="card">
             <p>ID: {t["id"]}</p>
+            <p>Remitente: <b>{t["remitente"]}</b></p>
             <p>Fecha: <b>{t["fecha"]}</b></p>
             <p>Monto: <b>${t["monto"]}</b></p>
             <p>Estado: {estado}</p>
@@ -150,39 +128,6 @@ def home():
     """
     return html
 
-@app.get("/debug-json")
-def debug_json():
-    return JSONResponse(content=ultimo_json_debug)
-
-@app.post("/configurar-token")
-async def configurar_token(token: str = Form(...)):
-    token_limpio = token.strip()
-    if not token_limpio or len(token_limpio) < 10:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El token ingresado no tiene un formato válido.")
-
-    headers = {
-        "Authorization": f"Bearer {token_limpio}",
-        "Accept": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            test_resp = await client.get(f"{API_BASE}/users/me", headers=headers)
-            if test_resp.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST, 
-                    detail="Token inválido o rechazado por Mercado Pago. Verificá tus credenciales."
-                )
-        except httpx.RequestError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
-                detail="No se pudo conectar con Mercado Pago para validar el token."
-            )
-
-    config_memoria["mp_access_token"] = token_limpio
-    logger.info("Token validado y guardado exitosamente.")
-    return {"message": "Token verificado y guardado exitosamente."}
-
 @app.post("/sincronizar-reportes")
 async def sincronizar_reportes():
     global ultimo_json_debug
@@ -239,11 +184,27 @@ async def sincronizar_reportes():
                     else:
                         fecha_limpia = "Sin fecha"
 
+                    # Extracción segura del nombre del remitente contemplando rutas alternativas
+                    payer_info = p.get("payer", {}) or {}
+                    bank_info = p.get("point_of_interaction", {}).get("transaction_data", {}).get("bank_info", {}).get("payer", {}) or {}
+                    
+                    nombre_remitente = (
+                        payer_info.get("first_name") or 
+                        bank_info.get("account_holder_name") or 
+                        bank_info.get("long_name") or 
+                        "Remitente anónimo / Transferencia CVU"
+                    )
+                    
+                    apellido = payer_info.get("last_name")
+                    if apellido and not bank_info.get("account_holder_name"):
+                        nombre_remitente = f"{nombre_remitente} {apellido}"
+
                     if p_id and monto > 0 and not any(t["id"] == p_id for t in transacciones_memoria):
                         transacciones_memoria.append({
                             "id": p_id,
                             "monto": abs(monto),
                             "fecha": fecha_limpia,
+                            "remitente": nombre_remitente,
                             "entregado": False
                         })
                         nuevas_cantidades += 1
@@ -258,19 +219,3 @@ async def sincronizar_reportes():
     except Exception as e:
         logger.error(f"Error crítico en sincronización: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Ocurrió un error inesperado al procesar la sincronización.")
-
-@app.post("/marcar-entregado/{payment_id}")
-def marcar_entregado(payment_id: str):
-    try:
-        for t in transacciones_memoria:
-            if t["id"] == payment_id:
-                if t["entregado"]:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="La transacción ya figura como entregada.")
-                t["entregado"] = True
-                return {"message": "Marcado como entregado correctamente."}
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transacción no encontrada.")
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Error al marcar como entregado ({payment_id}): {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error interno al actualizar el estado de la transacción.")
